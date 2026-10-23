@@ -108,6 +108,14 @@ def init_db():
             )
         """)
         db.execute("""
+            CREATE TABLE IF NOT EXISTS seminar_announcements (
+                seminar_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (seminar_id, chat_id, message_id)
+            )
+        """)
+        db.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_one_topic_per_user_per_seminar
             ON seminar_topics(seminar_id, user_id) WHERE user_id IS NOT NULL
         """)
@@ -256,6 +264,11 @@ def seminars_keyboard(user_id=None):
         rows.append([InlineKeyboardButton(
             text=f"📚 {seminar['title']} ({taken}/{total})", callback_data=f"seminar_view:{seminar['id']}"
         )])
+        if user_id == ADMIN_ID:
+            rows.append([
+                InlineKeyboardButton(text=f"📢 Опубликовать: {seminar['title'][:28]}", callback_data=f"seminar_publish:{seminar['id']}"),
+                InlineKeyboardButton(text=f"🗑 Удалить: {seminar['title'][:28]}", callback_data=f"seminar_delete:{seminar['id']}")
+            ])
     if user_id == ADMIN_ID:
         rows.append([InlineKeyboardButton(text="➕ Создать семинар", callback_data="seminar_create")])
     rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
@@ -290,6 +303,22 @@ async def show_my_id(message: Message):
 @dp.message(CommandStart())
 async def start(message: Message):
     parts = (message.text or "").split(maxsplit=1)
+    if len(parts) > 1 and parts[1].startswith("seminar_"):
+        try:
+            seminar_id = int(parts[1].replace("seminar_", "", 1))
+        except ValueError:
+            seminar_id = 0
+        if seminar_id:
+            with connect_db() as db:
+                seminar = db.execute("SELECT id, title FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
+            if seminar:
+                await message.answer(
+                    f"📚 Семинар: {seminar['title']}\nНажми на свободную тему, чтобы занять её.",
+                    reply_markup=seminar_topics_keyboard(seminar_id)
+                )
+            else:
+                await message.answer("👽 Этот семинар не найден. Возможно, его уже удалили.")
+            return
     if len(parts) > 1 and parts[1].startswith("queue_"):
         try:
             queue_id = int(parts[1].replace("queue_", "", 1))
@@ -518,6 +547,100 @@ async def seminar_create_start(callback: CallbackQuery):
     waiting_for_seminar_title.add(callback.from_user.id)
     await callback.answer()
     await callback.message.answer("➕ Напиши название семинара или предмета. Например: «История искусства — семинар 2».")
+
+
+@dp.callback_query(F.data.startswith("seminar_publish:"))
+async def publish_seminar(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Публиковать семинары может только староста!", show_alert=True)
+        return
+    seminar_id = int(callback.data.split(":")[1])
+    with connect_db() as db:
+        seminar = db.execute("SELECT id, title FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
+        topics = db.execute(
+            "SELECT COUNT(*) FROM seminar_topics WHERE seminar_id = ?", (seminar_id,)
+        ).fetchone()[0]
+    if not seminar:
+        await callback.answer("Семинар не найден.", show_alert=True)
+        return
+    try:
+        me = await bot.get_me()
+        if not me.username:
+            await callback.answer("Не удалось получить имя бота.", show_alert=True)
+            return
+        link = f"https://t.me/{me.username}?start=seminar_{seminar_id}"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📚 Выбрать тему семинара", url=link)
+        ]])
+        sent = await bot.send_message(
+            GROUP_CHAT_ID,
+            f"📢 ЗАПИСЬ НА СЕМИНАР ОТКРЫТА!\n\n"
+            f"📚 {seminar['title']}\n"
+            f"📝 Тем в списке: {topics}\n\n"
+            "👇 Нажмите кнопку, чтобы посмотреть темы и выбрать свою.",
+            reply_markup=keyboard
+        )
+        with connect_db() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO seminar_announcements (seminar_id, chat_id, message_id) VALUES (?, ?, ?)",
+                (seminar_id, GROUP_CHAT_ID, sent.message_id)
+            )
+        await callback.answer("Семинар опубликован в группе! 📢")
+        await callback.message.answer(f"✅ Семинар «{seminar['title']}» опубликован в группе!")
+    except Exception as error:
+        print(f"Ошибка публикации семинара: {error}")
+        await callback.answer("Не получилось опубликовать. Проверь, что бот есть в группе и может писать сообщения.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("seminar_delete:"))
+async def delete_seminar_confirm(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Удалять семинары может только староста!", show_alert=True)
+        return
+    seminar_id = int(callback.data.split(":")[1])
+    with connect_db() as db:
+        seminar = db.execute("SELECT id, title FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
+    if not seminar:
+        await callback.answer("Семинар уже не существует.", show_alert=True)
+        return
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💥 Да, удалить семинар", callback_data=f"seminar_delete_yes:{seminar_id}"),
+        InlineKeyboardButton(text="🛡 Отмена", callback_data="seminars")
+    ]])
+    await callback.answer()
+    await callback.message.answer(
+        f"⚠️ Точно удалить семинар «{seminar['title']}»? Все темы и записи на них будут удалены.",
+        reply_markup=keyboard
+    )
+
+
+@dp.callback_query(F.data.startswith("seminar_delete_yes:"))
+async def delete_seminar_execute(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Только староста!", show_alert=True)
+        return
+    seminar_id = int(callback.data.split(":")[1])
+    with connect_db() as db:
+        seminar = db.execute("SELECT id, title FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
+        announcements = db.execute(
+            "SELECT chat_id, message_id FROM seminar_announcements WHERE seminar_id = ?", (seminar_id,)
+        ).fetchall()
+        if not seminar:
+            await callback.answer("Семинар уже удалён.", show_alert=True)
+            return
+        db.execute("DELETE FROM seminar_topics WHERE seminar_id = ?", (seminar_id,))
+        db.execute("DELETE FROM seminar_announcements WHERE seminar_id = ?", (seminar_id,))
+        db.execute("DELETE FROM seminars WHERE id = ?", (seminar_id,))
+    for announcement in announcements:
+        try:
+            await bot.delete_message(chat_id=announcement["chat_id"], message_id=announcement["message_id"])
+        except Exception as error:
+            print(f"Не удалось удалить старое объявление семинара: {error}")
+    await callback.answer("Семинар удалён.")
+    await callback.message.answer(
+        f"💥 Семинар «{seminar['title']}» удалён вместе с темами и записями.",
+        reply_markup=seminars_keyboard(callback.from_user.id)
+    )
 
 
 @dp.callback_query(F.data.startswith("seminar_view:"))
