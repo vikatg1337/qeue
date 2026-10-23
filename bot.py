@@ -16,8 +16,10 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("Не найден токен! Проверь переменную окружения BOT_TOKEN или файл .env")
 
-# На сервере не используем локальный прокси компьютера.
-session = AiohttpSession(proxy="http://127.0.0.1:10809")
+# Прокси задаётся только при необходимости через BOT_PROXY в окружении/.env.
+# На FadeHost оставь BOT_PROXY пустым, если сервер подключается к Telegram напрямую.
+PROXY = os.getenv("BOT_PROXY") or None
+session = AiohttpSession(proxy=PROXY)
 bot = Bot(token=TOKEN, session=session)
 dp = Dispatcher()
 
@@ -492,11 +494,24 @@ async def delete_queue_execute(callback: CallbackQuery):
         return
     queue_id = int(callback.data.split(":")[1])
     with connect_db() as db:
+        announcements = db.execute(
+            "SELECT chat_id, message_id FROM announcements WHERE queue_id = ?", (queue_id,)
+        ).fetchall()
         db.execute("DELETE FROM bookings WHERE queue_id = ?", (queue_id,))
         db.execute("DELETE FROM announcements WHERE queue_id = ?", (queue_id,))
         cursor = db.execute("DELETE FROM queues WHERE id = ?", (queue_id,))
     await callback.answer()
     if cursor.rowcount:
+        # Убираем объявления из чата, чтобы участники не открывали удалённую очередь.
+        for announcement in announcements:
+            try:
+                await bot.delete_message(
+                    chat_id=announcement["chat_id"],
+                    message_id=announcement["message_id"],
+                )
+            except Exception as error:
+                # Например, если сообщение уже удалили вручную или у бота нет прав.
+                print(f"Не удалось удалить объявление очереди: {error}")
         await callback.message.answer("💥 Очередь удалена. Одной проблемой меньше.", reply_markup=main_menu(callback.from_user.id))
     else:
         await callback.message.answer("Очередь уже удалена.")
@@ -678,8 +693,20 @@ async def topic_book(callback: CallbackQuery):
         if existing:
             await callback.answer(f"Ты уже выбрал(а) тему: {existing['topic_name']}", show_alert=True)
             return
-        db.execute("UPDATE seminar_topics SET user_id = ?, user_name = ?, booked_at = ? WHERE id = ? AND user_id IS NULL",
-                   (user_id, callback.from_user.full_name or "Участник", datetime.utcnow().isoformat(timespec="seconds"), topic_id))
+        try:
+            cursor = db.execute(
+                "UPDATE seminar_topics SET user_id = ?, user_name = ?, booked_at = ? "
+                "WHERE id = ? AND user_id IS NULL",
+                (user_id, callback.from_user.full_name or "Участник",
+                 datetime.utcnow().isoformat(timespec="seconds"), topic_id),
+            )
+        except sqlite3.IntegrityError:
+            # Защита ограничения БД: один участник — одна тема в рамках семинара.
+            await callback.answer("Ты уже выбрал(а) другую тему этого семинара.", show_alert=True)
+            return
+        if cursor.rowcount != 1:
+            await callback.answer("Эту тему только что заняли. Обнови список.", show_alert=True)
+            return
     await callback.answer("🎉 Тема за тобой!")
     await callback.message.answer("Тема занята!", reply_markup=seminar_topics_keyboard(topic["seminar_id"]))
 
@@ -729,7 +756,10 @@ async def receive_text(message: Message):
             return
         with connect_db() as db:
             taken = db.execute("SELECT 1 FROM bookings WHERE queue_id = ? AND place = ?", (queue_id, place)).fetchone()
-            duplicate = db.execute("SELECT 1 FROM bookings WHERE queue_id = ? AND lower(user_name) = lower(?)", (queue_id, text)).fetchone()
+            duplicate = db.execute(
+                "SELECT 1 FROM bookings WHERE queue_id = ? AND lower(user_name) = lower(?)",
+                (queue_id, text),
+            ).fetchone()
             if taken:
                 await message.answer("Место уже успели занять. Обнови очередь и выбери другое.")
                 return
@@ -859,16 +889,20 @@ async def receive_text(message: Message):
             return
         if text.upper() == "ГОТОВО":
             title = waiting_for_seminar_topics.pop(user_id)
+            # Не создаём пустой семинар, если староста сразу нажал «ГОТОВО».
+            topics = staged_topics.pop(user_id, [])
+            if not topics:
+                await message.answer(
+                    "Список тем пустой. Отправь хотя бы одну тему или /cancel для отмены.",
+                    reply_markup=main_menu(user_id),
+                )
+                waiting_for_seminar_topics[user_id] = title
+                staged_topics[user_id] = []
+                return
             with connect_db() as db:
                 cursor = db.execute("INSERT INTO seminars (title, created_by, created_at) VALUES (?, ?, ?)",
                                     (title, user_id, datetime.utcnow().isoformat(timespec="seconds")))
                 seminar_id = cursor.lastrowid
-            # Topics are staged in a temporary attribute per admin while entering the list.
-            topics = staged_topics.pop(user_id, [])
-            if not topics:
-                await message.answer("Семинар создан, но тем не добавлено. Создай новый семинар со списком тем.", reply_markup=main_menu(user_id))
-                return
-            with connect_db() as db:
                 db.executemany("INSERT INTO seminar_topics (seminar_id, topic_name) VALUES (?, ?)", [(seminar_id, topic) for topic in topics])
             await message.answer(f"🎉 Семинар «{title}» создан: тем — {len(topics)}.", reply_markup=main_menu(user_id))
             await message.answer("Список тем:", reply_markup=seminar_topics_keyboard(seminar_id))
