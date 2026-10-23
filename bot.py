@@ -37,6 +37,8 @@ JOKES = [
     "...",
     "Скачать вирусы без промоушен",
     "🐸 Кто рано записался, тот рано начал переживать",
+    "спасибо моим бета-тестерам что терпят непонятные соо в чате",
+    "продам гараж",
     "67",
 ]
 
@@ -551,7 +553,7 @@ async def select_group(callback: CallbackQuery):
 
 @dp.message(F.text == "/myid")
 async def show_my_id(message: Message):
-    await message.answer(f"🪪 Твой Telegram ID: `{message.from_user.id}`\nЗапиши его — это пропуск в админку 😎", parse_mode="Markdown")
+    await message.answer(f"🪪 Твой Telegram ID: `{message.from_user.id}`\nЗапиши его и отдай Вике патамушта так нада", parse_mode="Markdown")
 
 
 @dp.message(CommandStart())
@@ -779,7 +781,7 @@ async def delete_queue_execute(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("publish:"))
 async def publish_queue(callback: CallbackQuery):
     if not user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
-        await callback.answer("⛔ Публиковать очереди может только староста!", show_alert=True)
+        await callback.answer("⛔ Публиковать очереди может только староста! сорян( если вы староста обратитесь к Вике", show_alert=True)
         return
     queue_id = int(callback.data.split(":")[1])
     queue = get_queue(queue_id)
@@ -804,7 +806,7 @@ async def publish_queue(callback: CallbackQuery):
             db.execute("INSERT OR IGNORE INTO announcements (queue_id, chat_id, message_id) VALUES (?, ?, ?)",
                        (queue_id, queue["group_chat_id"], sent_message.message_id))
         await callback.answer("Объявление опубликовано! 📢")
-        await callback.message.answer(f"✅ Очередь «{queue['name']}» опубликована в группе!\nВикин IT-отдел доволен 😎")
+        await callback.message.answer(f"✅ Очередь «{queue['name']}» опубликована в группе!\nДизайнерский IT-отдел доволен 😎")
     except Exception as error:
         print(f"Ошибка публикации: {error}")
         await callback.answer("Не получилось опубликовать. Проверь, что бот есть в группе.", show_alert=True)
@@ -1023,7 +1025,7 @@ async def receive_text(message: Message):
         waiting_for_seminar_title.discard(user_id)
         waiting_for_seminar_topics.pop(user_id, None)
         staged_topics.pop(user_id, None)
-        await message.answer("Окей, действие отменено.", reply_markup=main_menu(user_id))
+        await message.answer("Окей, как хош.", reply_markup=main_menu(user_id))
         return
 
     if user_id in waiting_for_proxy_name:
@@ -1107,7 +1109,7 @@ async def receive_text(message: Message):
         waiting_for_change.discard(user_id)
         waiting_for_change_queue.pop(user_id, None)
         await update_queue_announcement(queue_id)
-        await message.answer(f"✨ Пересадка успешна! Новое место — № {place}", reply_markup=main_menu(user_id))
+        await message.answer(f"✨ Пересадка успешна! С новосельем! Новое место — № {place}", reply_markup=main_menu(user_id))
         await message.answer(queue_text(queue_id), reply_markup=queue_keyboard(queue_id))
         return
 
