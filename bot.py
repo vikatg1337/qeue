@@ -279,17 +279,19 @@ def seminars_keyboard(user_id=None):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+
+
 def seminar_topics_keyboard(seminar_id):
-    with connect_db() as db:      
-topics = db.execute(
-    """
-    SELECT id, seminar_id, topic_name, user_id, user_name
-    FROM seminar_topics
-    WHERE seminar_id = ?
-    ORDER BY id
-    """,
-    (seminar_id,),
-).fetchall()
+    with connect_db() as db:
+        topics = db.execute(
+            """
+            SELECT id, seminar_id, topic_name, user_id, user_name
+            FROM seminar_topics
+            WHERE seminar_id = ?
+            ORDER BY id
+            """,
+            (seminar_id,),
+        ).fetchall()
 
     rows = []
     for topic in topics:
@@ -300,9 +302,11 @@ topics = db.execute(
             label = f"🔴 {topic['topic_name']} — {topic['user_name']}"
             callback = f"topic_taken:{topic['id']}"
         rows.append([InlineKeyboardButton(text=label[:60], callback_data=callback)])
+
     rows.append([InlineKeyboardButton(text="❌ Снять мою тему", callback_data=f"topic_cancel:{seminar_id}")])
     rows.append([InlineKeyboardButton(text="⬅️ К семинарам", callback_data="seminars")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 
 @dp.message(F.text == "/myid")
