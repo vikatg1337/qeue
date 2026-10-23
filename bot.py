@@ -280,11 +280,17 @@ def seminars_keyboard(user_id=None):
 
 
 def seminar_topics_keyboard(seminar_id):
-    with connect_db() as db:
-        topics = db.execute(
-            "SELECT id, topic_name, user_id, user_name FROM seminar_topics WHERE seminar_id = ? ORDER BY id",
-            (seminar_id,),
-        ).fetchall()
+    with connect_db() as db:      
+topics = db.execute(
+    """
+    SELECT id, seminar_id, topic_name, user_id, user_name
+    FROM seminar_topics
+    WHERE seminar_id = ?
+    ORDER BY id
+    """,
+    (seminar_id,),
+).fetchall()
+
     rows = []
     for topic in topics:
         if topic["user_id"] is None:
