@@ -278,7 +278,7 @@ def seminars_keyboard(user_id=None):
 def seminar_topics_keyboard(seminar_id):
     with connect_db() as db:
         topics = db.execute(
-            "SELECT id, topic_name, user_name FROM seminar_topics WHERE seminar_id = ? ORDER BY id",
+            "SELECT id, topic_name, user_name, user_id FROM seminar_topics WHERE seminar_id = ? ORDER BY id",
             (seminar_id,),
         ).fetchall()
     rows = []
