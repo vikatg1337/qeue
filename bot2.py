@@ -16,9 +16,7 @@ TOKEN = os.getenv("BOT2_TOKEN")
 if not TOKEN:
     raise RuntimeError("Не найден токен! Проверь переменную окружения BOT2_TOKEN или файл .env")
 
-# На сервере не используем локальный прокси компьютера.
-session = AiohttpSession(proxy="http://127.0.0.1:10809")
-bot = Bot(token=TOKEN, session=session)
+bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 DB_FILE = os.getenv("DB_FILE", "queues.db")
