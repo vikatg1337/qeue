@@ -280,7 +280,7 @@ def seminars_keyboard(user_id=None):
 def seminar_topics_keyboard(seminar_id):
     with connect_db() as db:
         topics = db.execute(
-            "SELECT id, topic_name, user_name FROM seminar_topics WHERE seminar_id = ? ORDER BY id",
+            "SELECT id, topic_name, user_id, user_name FROM seminar_topics WHERE seminar_id = ? ORDER BY id",
             (seminar_id,),
         ).fetchall()
     rows = []
@@ -664,24 +664,58 @@ async def delete_seminar_execute(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("topic_book:"))
 async def topic_book(callback: CallbackQuery):
-    topic_id = int(callback.data.split(":")[1])
+    try:
+        topic_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная тема.", show_alert=True)
+        return
+
     user_id = callback.from_user.id
-    with connect_db() as db:
-        topic = db.execute("SELECT id, seminar_id, topic_name, user_id FROM seminar_topics WHERE id = ?", (topic_id,)).fetchone()
-        if not topic:
-            await callback.answer("Тема не найдена.", show_alert=True)
-            return
-        if topic["user_id"] is not None:
-            await callback.answer("Эту тему уже заняли. Обнови список.", show_alert=True)
-            return
-        existing = db.execute("SELECT topic_name FROM seminar_topics WHERE seminar_id = ? AND user_id = ?", (topic["seminar_id"], user_id)).fetchone()
-        if existing:
-            await callback.answer(f"Ты уже выбрал(а) тему: {existing['topic_name']}", show_alert=True)
-            return
-        db.execute("UPDATE seminar_topics SET user_id = ?, user_name = ?, booked_at = ? WHERE id = ? AND user_id IS NULL",
-                   (user_id, callback.from_user.full_name or "Участник", datetime.utcnow().isoformat(timespec="seconds"), topic_id))
+    try:
+        with connect_db() as db:
+            topic = db.execute(
+                "SELECT id, seminar_id, topic_name, user_id FROM seminar_topics WHERE id = ?",
+                (topic_id,),
+            ).fetchone()
+            if not topic:
+                await callback.answer("Тема не найдена.", show_alert=True)
+                return
+            if topic["user_id"] is not None:
+                await callback.answer("Эту тему уже заняли. Обнови список.", show_alert=True)
+                return
+
+            existing = db.execute(
+                "SELECT topic_name FROM seminar_topics WHERE seminar_id = ? AND user_id = ?",
+                (topic["seminar_id"], user_id),
+            ).fetchone()
+            if existing:
+                await callback.answer(
+                    f"Ты уже выбрал(а) тему: {existing['topic_name']}", show_alert=True
+                )
+                return
+
+            cursor = db.execute(
+                "UPDATE seminar_topics SET user_id = ?, user_name = ?, booked_at = ? "
+                "WHERE id = ? AND user_id IS NULL",
+                (
+                    user_id,
+                    callback.from_user.full_name or "Участник",
+                    datetime.utcnow().isoformat(timespec="seconds"),
+                    topic_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                await callback.answer("Эту тему только что заняли. Обнови список.", show_alert=True)
+                return
+    except sqlite3.IntegrityError:
+        # Защита на случай, если два нажатия пришли почти одновременно.
+        await callback.answer("Ты уже записан(а) на тему этого семинара или тему заняли. Обнови список.", show_alert=True)
+        return
+
     await callback.answer("🎉 Тема за тобой!")
-    await callback.message.answer("Тема занята!", reply_markup=seminar_topics_keyboard(topic["seminar_id"]))
+    await callback.message.answer(
+        "Тема занята!", reply_markup=seminar_topics_keyboard(topic["seminar_id"])
+    )
 
 
 @dp.callback_query(F.data.startswith("topic_taken:"))
