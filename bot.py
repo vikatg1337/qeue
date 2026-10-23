@@ -6,8 +6,9 @@ import sqlite3
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 
@@ -27,7 +28,7 @@ DB_FILE = os.getenv("DB_FILE", "queues.db")
 ADMIN_IDS = {
     1053596260,
 }
-GROUP_CHAT_ID = -5496142597
+LEGACY_GROUP_CHAT_ID = -5496142597  # группа старого бота; её данные сохраняются
 
 JOKES = [
     "МЕМЕМЕМЕМЕМЕМЕМЕМЕМЕМЕМЕ",
@@ -59,6 +60,27 @@ def init_db():
     """Create missing tables and add new columns without deleting existing data."""
     with connect_db() as db:
         db.execute("""
+            CREATE TABLE IF NOT EXISTS groups_registry (
+                chat_id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                registered_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS group_admins (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                PRIMARY KEY (chat_id, user_id)
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS user_group_selection (
+                user_id INTEGER PRIMARY KEY,
+                chat_id INTEGER NOT NULL
+            )
+        """)
+        db.execute("""
             CREATE TABLE IF NOT EXISTS queues (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -68,6 +90,9 @@ def init_db():
         queue_columns = {row[1] for row in db.execute("PRAGMA table_info(queues)").fetchall()}
         if "places" not in queue_columns:
             db.execute("ALTER TABLE queues ADD COLUMN places INTEGER NOT NULL DEFAULT 32")
+        if "group_chat_id" not in queue_columns:
+            db.execute("ALTER TABLE queues ADD COLUMN group_chat_id INTEGER")
+        seminar_columns = {row[1] for row in db.execute("PRAGMA table_info(seminars)").fetchall()}
         db.execute("""
             CREATE TABLE IF NOT EXISTS bookings (
                 queue_id INTEGER NOT NULL,
@@ -100,6 +125,9 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
+        seminar_columns = {row[1] for row in db.execute("PRAGMA table_info(seminars)").fetchall()}
+        if "group_chat_id" not in seminar_columns:
+            db.execute("ALTER TABLE seminars ADD COLUMN group_chat_id INTEGER")
         db.execute("""
             CREATE TABLE IF NOT EXISTS seminar_topics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,6 +163,14 @@ def init_db():
             CREATE UNIQUE INDEX IF NOT EXISTS idx_one_topic_per_user_per_seminar
             ON seminar_topics(seminar_id, user_id) WHERE user_id IS NOT NULL
         """)
+        # Старые очереди и семинары остаются в прежней группе; новые получают group_chat_id.
+        db.execute("UPDATE queues SET group_chat_id = ? WHERE group_chat_id IS NULL", (LEGACY_GROUP_CHAT_ID,))
+        db.execute("UPDATE seminars SET group_chat_id = ? WHERE group_chat_id IS NULL", (LEGACY_GROUP_CHAT_ID,))
+        db.execute(
+            "INSERT OR IGNORE INTO groups_registry (chat_id, title, registered_by, created_at) VALUES (?, ?, ?, ?)",
+            (LEGACY_GROUP_CHAT_ID, "Старая группа (перенесена автоматически)", next(iter(ADMIN_IDS)), datetime.utcnow().isoformat(timespec="seconds"))
+        )
+        db.execute("INSERT OR IGNORE INTO group_admins (chat_id, user_id) VALUES (?, ?)", (LEGACY_GROUP_CHAT_ID, next(iter(ADMIN_IDS))))
         # Переносим старые записи в новую таблицу, не удаляя их из старой.
         db.execute("""
             INSERT OR IGNORE INTO seminar_topic_bookings (topic_id, user_id, user_name, booked_at)
@@ -143,14 +179,122 @@ def init_db():
         """, (datetime.utcnow().isoformat(timespec="seconds"),))
 
 
-def get_queues():
+def selected_group_id(user_id):
     with connect_db() as db:
-        return db.execute("SELECT id, name, places FROM queues ORDER BY id DESC").fetchall()
+        row = db.execute("SELECT chat_id FROM user_group_selection WHERE user_id = ?", (user_id,)).fetchone()
+        if row:
+            return row["chat_id"]
+    return LEGACY_GROUP_CHAT_ID
+
+
+def set_selected_group(user_id, chat_id):
+    with connect_db() as db:
+        db.execute(
+            "INSERT INTO user_group_selection (user_id, chat_id) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET chat_id = excluded.chat_id",
+            (user_id, chat_id),
+        )
+
+
+def is_registered_group(chat_id):
+    with connect_db() as db:
+        return db.execute("SELECT 1 FROM groups_registry WHERE chat_id = ?", (chat_id,)).fetchone() is not None
+
+
+def user_is_group_admin(user_id, chat_id):
+    with connect_db() as db:
+        return db.execute(
+            "SELECT 1 FROM group_admins WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+        ).fetchone() is not None
+
+
+async def verify_group_member(user_id, chat_id):
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in {"creator", "administrator", "member"}
+    except Exception:
+        return False
+
+
+async def verify_group_admin(user_id, chat_id):
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in {"creator", "administrator"}
+    except Exception:
+        return False
+
+
+def item_belongs_to_group(kind, item_id, chat_id):
+    table = "queues" if kind == "queue" else "seminars"
+    with connect_db() as db:
+        return db.execute(
+            f"SELECT 1 FROM {table} WHERE id = ? AND group_chat_id = ?", (item_id, chat_id)
+        ).fetchone() is not None
+
+
+async def callback_item_access(callback, kind, item_id):
+    chat_id = selected_group_id(callback.from_user.id)
+    if not item_belongs_to_group(kind, item_id, chat_id):
+        await callback.answer("⛔ Это относится к другой группе. Открой нужную группу через /groups.", show_alert=True)
+        return False
+    if not await verify_group_member(callback.from_user.id, chat_id):
+        await callback.answer("⛔ Бот не может подтвердить, что ты участник выбранной группы. Проверь, что бот добавлен в группу.", show_alert=True)
+        return False
+    return True
+
+
+class TenantIsolationMiddleware(BaseMiddleware):
+    """Checks ownership and membership for every item callback, including forged buttons."""
+    async def __call__(self, handler, event, data):
+        payload = getattr(event, "data", None)
+        user = getattr(event, "from_user", None)
+        if not payload or not user or payload.startswith("group_select:"):
+            return await handler(event, data)
+        group_id = selected_group_id(user.id)
+        kind = None
+        item_id = None
+        try:
+            if payload.startswith(("view:", "place:", "bookself:", "bookother:", "cancel:", "change:", "delete:", "delete_yes:", "publish:")):
+                kind = "queue"
+                item_id = int(payload.split(":")[1])
+            elif payload.startswith(("seminar_view:", "seminar_publish:", "seminar_delete:", "seminar_delete_yes:", "topic_cancel:")):
+                kind = "seminar"
+                item_id = int(payload.split(":")[1])
+            elif payload.startswith("topic_book:"):
+                topic_id = int(payload.split(":")[1])
+                with connect_db() as db:
+                    parent = db.execute("SELECT s.id FROM seminars s JOIN seminar_topics t ON t.seminar_id=s.id WHERE t.id=? AND s.group_chat_id=?", (topic_id, group_id)).fetchone()
+                if not parent:
+                    await event.answer("⛔ Эта тема относится к другой группе.", show_alert=True)
+                    return
+                if not await verify_group_member(user.id, group_id):
+                    await event.answer("⛔ Не удалось подтвердить участие в выбранной группе.", show_alert=True)
+                    return
+            if kind and item_id is not None:
+                if not item_belongs_to_group(kind, item_id, group_id):
+                    await event.answer("⛔ Это относится к другой группе. Открой /groups и выбери свою.", show_alert=True)
+                    return
+                if not await verify_group_member(user.id, group_id):
+                    await event.answer("⛔ Не удалось подтвердить участие в выбранной группе.", show_alert=True)
+                    return
+        except (ValueError, IndexError):
+            await event.answer("Некорректная кнопка. Открой меню заново.", show_alert=True)
+            return
+        return await handler(event, data)
+
+
+dp.callback_query.outer_middleware(TenantIsolationMiddleware())
+
+
+def get_queues(user_id=None):
+    chat_id = selected_group_id(user_id) if user_id is not None else LEGACY_GROUP_CHAT_ID
+    with connect_db() as db:
+        return db.execute("SELECT id, name, places FROM queues WHERE group_chat_id = ? ORDER BY id DESC", (chat_id,)).fetchall()
 
 
 def get_queue(queue_id):
     with connect_db() as db:
-        return db.execute("SELECT id, name, places FROM queues WHERE id = ?", (queue_id,)).fetchone()
+        return db.execute("SELECT id, name, places, group_chat_id FROM queues WHERE id = ?", (queue_id,)).fetchone()
 
 
 def get_bookings(queue_id):
@@ -208,20 +352,21 @@ def main_menu(user_id=None):
         [InlineKeyboardButton(text="➕ Создать очередь", callback_data="create")],
         [InlineKeyboardButton(text="📋 Все очереди", callback_data="queues")],
         [InlineKeyboardButton(text="📚 Темы семинаров", callback_data="seminars")],
+        [InlineKeyboardButton(text="🏫 Выбрать учебную группу (/groups)", callback_data="groups_help")],
     ]
-    if user_id in ADMIN_IDS:
+    if user_id is not None and user_is_group_admin(user_id, selected_group_id(user_id)):
         rows.append([InlineKeyboardButton(text="➕ Создать семинар", callback_data="seminar_create")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def queues_keyboard(user_id=None):
     rows = []
-    for queue in get_queues():
+    for queue in get_queues(user_id):
         occupied = len(get_bookings(queue["id"]))
         rows.append([InlineKeyboardButton(
             text=f"📋 {queue['name']} ({occupied}/{queue['places']})", callback_data=f"view:{queue['id']}"
         )])
-        if user_id in ADMIN_IDS:
+        if user_id is not None and user_is_group_admin(user_id, selected_group_id(user_id)):
             rows.append([InlineKeyboardButton(
                 text=f"🗑 Удалить: {queue['name']}", callback_data=f"delete:{queue['id']}"
             )])
@@ -278,7 +423,7 @@ def queue_text(queue_id):
 def seminars_keyboard(user_id=None):
     rows = []
     with connect_db() as db:
-        seminars = db.execute("SELECT id, title FROM seminars ORDER BY id DESC").fetchall()
+        seminars = db.execute("SELECT id, title FROM seminars WHERE group_chat_id = ? ORDER BY id DESC", (selected_group_id(user_id) if user_id is not None else LEGACY_GROUP_CHAT_ID,)).fetchall()
     for seminar in seminars:
         with connect_db() as db:
             total = db.execute("SELECT COUNT(*) FROM seminar_topics WHERE seminar_id = ?", (seminar["id"],)).fetchone()[0]
@@ -291,12 +436,12 @@ def seminars_keyboard(user_id=None):
         rows.append([InlineKeyboardButton(
             text=f"📚 {seminar['title']} ({taken}/{total})", callback_data=f"seminar_view:{seminar['id']}"
         )])
-        if user_id in ADMIN_IDS:
+        if user_id is not None and user_is_group_admin(user_id, selected_group_id(user_id)):
             rows.append([
                 InlineKeyboardButton(text=f"📢 Опубликовать: {seminar['title'][:28]}", callback_data=f"seminar_publish:{seminar['id']}"),
                 InlineKeyboardButton(text=f"🗑 Удалить: {seminar['title'][:28]}", callback_data=f"seminar_delete:{seminar['id']}")
             ])
-    if user_id in ADMIN_IDS:
+    if user_id is not None and user_is_group_admin(user_id, selected_group_id(user_id)):
         rows.append([InlineKeyboardButton(text="➕ Создать семинар", callback_data="seminar_create")])
     rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -340,6 +485,69 @@ def seminar_topics_keyboard(seminar_id):
 
 
 
+
+@dp.message(Command("setup"))
+async def setup_group(message: Message):
+    if message.chat.type not in {"group", "supergroup"}:
+        await message.answer("Команду /setup нужно отправить внутри вашей учебной группы.")
+        return
+    if not await verify_group_admin(message.from_user.id, message.chat.id):
+        await message.answer("⛔ Зарегистрировать группу может только её администратор/староста.")
+        return
+    try:
+        bot_member = await bot.get_chat_member(message.chat.id, (await bot.get_me()).id)
+        if bot_member.status not in {"administrator", "creator"}:
+            await message.answer("Сначала выдай боту права администратора в этой группе, затем повтори /setup.")
+            return
+        admins = await bot.get_chat_administrators(message.chat.id)
+    except Exception:
+        await message.answer("Не получилось проверить права. Убедись, что бот добавлен в группу и имеет права администратора.")
+        return
+    with connect_db() as db:
+        db.execute(
+            "INSERT INTO groups_registry (chat_id, title, registered_by, created_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title, registered_by = excluded.registered_by",
+            (message.chat.id, message.chat.title or str(message.chat.id), message.from_user.id, datetime.utcnow().isoformat(timespec="seconds"))
+        )
+        db.execute("DELETE FROM group_admins WHERE chat_id = ?", (message.chat.id,))
+        for admin in admins:
+            db.execute("INSERT OR IGNORE INTO group_admins (chat_id, user_id) VALUES (?, ?)", (message.chat.id, admin.user.id))
+    set_selected_group(message.from_user.id, message.chat.id)
+    await message.answer("✅ Группа подключена! Теперь открой бота в личке и отправь /groups, чтобы выбрать эту группу.")
+
+
+@dp.message(Command("groups"))
+async def list_groups(message: Message):
+    with connect_db() as db:
+        groups = db.execute("SELECT chat_id, title FROM groups_registry ORDER BY title").fetchall()
+    if not groups:
+        await message.answer("Пока нет зарегистрированных групп. Староста должна отправить /setup внутри группы.")
+        return
+    rows = []
+    for group in groups:
+        if await verify_group_member(message.from_user.id, group["chat_id"]):
+            rows.append([InlineKeyboardButton(text=f"🏫 {group['title']}", callback_data=f"group_select:{group['chat_id']}")])
+    if not rows:
+        await message.answer("Не нашла группы, в которых могу подтвердить твоё участие. Убедитесь, что бот добавлен в группу и имеет права администратора.")
+        return
+    await message.answer("Выбери свою учебную группу. Очереди и темы других групп будут скрыты:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data.startswith("group_select:"))
+async def select_group(callback: CallbackQuery):
+    try:
+        chat_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная группа.", show_alert=True)
+        return
+    if not is_registered_group(chat_id) or not await verify_group_member(callback.from_user.id, chat_id):
+        await callback.answer("⛔ Не удалось подтвердить участие в этой группе.", show_alert=True)
+        return
+    set_selected_group(callback.from_user.id, chat_id)
+    await callback.answer("Группа выбрана!")
+    await callback.message.answer("🏫 Группа выбрана. Открывай меню:", reply_markup=main_menu(callback.from_user.id))
+
+
 @dp.message(F.text == "/myid")
 async def show_my_id(message: Message):
     await message.answer(f"🪪 Твой Telegram ID: `{message.from_user.id}`\nЗапиши его — это пропуск в админку 😎", parse_mode="Markdown")
@@ -355,8 +563,9 @@ async def start(message: Message):
             seminar_id = 0
         if seminar_id:
             with connect_db() as db:
-                seminar = db.execute("SELECT id, title FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
-            if seminar:
+                seminar = db.execute("SELECT id, title, group_chat_id FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
+            if seminar and await verify_group_member(message.from_user.id, seminar["group_chat_id"]):
+                set_selected_group(message.from_user.id, seminar["group_chat_id"])
                 await message.answer(
                     f"📚 {seminar['title']}\nНажми на свободную тему, чтобы занять её.",
                     reply_markup=seminar_topics_keyboard(seminar_id)
@@ -370,7 +579,9 @@ async def start(message: Message):
         except ValueError:
             queue_id = 0
         if queue_id:
-            if get_queue(queue_id):
+            queue_for_link = get_queue(queue_id)
+            if queue_for_link and await verify_group_member(message.from_user.id, queue_for_link["group_chat_id"]):
+                set_selected_group(message.from_user.id, queue_for_link["group_chat_id"])
                 await message.answer("📩 Ты прибыл по секретной ссылке старосты!\nДобро пожаловать!")
                 await message.answer(queue_text(queue_id), reply_markup=queue_keyboard(queue_id))
             else:
@@ -384,6 +595,12 @@ async def start(message: Message):
     )
 
 
+@dp.callback_query(F.data == "groups_help")
+async def groups_help(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer("Отправь команду /groups, чтобы выбрать учебную группу. Новую группу староста подключает командой /setup внутри группового чата.")
+
+
 @dp.callback_query(F.data == "home")
 async def home(callback: CallbackQuery):
     await callback.answer()
@@ -393,7 +610,7 @@ async def home(callback: CallbackQuery):
 @dp.callback_query(F.data == "create")
 async def create_queue_start(callback: CallbackQuery):
     print("ADMIN CHECK:", callback.from_user.id, ADMIN_IDS)  # ← ВСТАВЬ ЭТУ СТРОКУ
-    if callback.from_user.id not in ADMIN_IDS:
+    if not user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
         await callback.answer("⛔ Создавать очереди может только староста!", show_alert=True)
         return
     waiting_for_queue_name.add(callback.from_user.id)
@@ -404,7 +621,7 @@ async def create_queue_start(callback: CallbackQuery):
 @dp.callback_query(F.data == "queues")
 async def show_queues(callback: CallbackQuery):
     await callback.answer()
-    if not get_queues():
+    if not get_queues(callback.from_user.id):
         await callback.message.answer("📭 Очередей пока нет. Можно создать первую!", reply_markup=main_menu(callback.from_user.id))
         return
     await callback.message.answer("📚 Все очереди — выбирай, где будем страдать:", reply_markup=queues_keyboard(callback.from_user.id))
@@ -512,7 +729,7 @@ async def change_booking(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("delete:"))
 async def delete_queue_confirm(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
         await callback.answer("⛔ Только староста может удалять очереди!", show_alert=True)
         return
     queue_id = int(callback.data.split(":")[1])
@@ -530,7 +747,7 @@ async def delete_queue_confirm(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("delete_yes:"))
 async def delete_queue_execute(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
         await callback.answer("⛔ Только староста!", show_alert=True)
         return
     queue_id = int(callback.data.split(":")[1])
@@ -560,7 +777,7 @@ async def delete_queue_execute(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("publish:"))
 async def publish_queue(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
         await callback.answer("⛔ Публиковать очереди может только староста!", show_alert=True)
         return
     queue_id = int(callback.data.split(":")[1])
@@ -576,7 +793,7 @@ async def publish_queue(callback: CallbackQuery):
         link = f"https://t.me/{me.username}?start=queue_{queue_id}"
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📝 Открыть очередь и записаться", url=link)]])
         sent_message = await bot.send_message(
-            GROUP_CHAT_ID,
+            queue["group_chat_id"],
             f"📢 ОБЪЯВЛЕНА НОВАЯ ОЧЕРЕДЬ!\n\n📚 {queue['name']}\n\n"
             f"🟢 Свободно мест: {queue['places'] - len(get_bookings(queue_id))}/{queue['places']}\n\n"
             "🎓 Выбирайте свободное место в боте.\n💀 Не тяните до последней минуты!",
@@ -584,7 +801,7 @@ async def publish_queue(callback: CallbackQuery):
         )
         with connect_db() as db:
             db.execute("INSERT OR IGNORE INTO announcements (queue_id, chat_id, message_id) VALUES (?, ?, ?)",
-                       (queue_id, GROUP_CHAT_ID, sent_message.message_id))
+                       (queue_id, queue["group_chat_id"], sent_message.message_id))
         await callback.answer("Объявление опубликовано! 📢")
         await callback.message.answer(f"✅ Очередь «{queue['name']}» опубликована в группе!\nВикин IT-отдел доволен 😎")
     except Exception as error:
@@ -600,7 +817,7 @@ async def show_seminars(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "seminar_create")
 async def seminar_create_start(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
         await callback.answer("⛔ Создавать семинары может только староста!", show_alert=True)
         return
     waiting_for_seminar_title.add(callback.from_user.id)
@@ -612,7 +829,7 @@ async def seminar_create_start(callback: CallbackQuery):
 async def seminar_view(callback: CallbackQuery):
     seminar_id = int(callback.data.split(":")[1])
     with connect_db() as db:
-        seminar = db.execute("SELECT id, title FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
+        seminar = db.execute("SELECT id, title, group_chat_id FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
         count = db.execute("SELECT COUNT(*) FROM seminar_topics WHERE seminar_id = ?", (seminar_id,)).fetchone()[0]
     await callback.answer()
     if not seminar:
@@ -626,12 +843,12 @@ async def seminar_view(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("seminar_publish:"))
 async def publish_seminar(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
         await callback.answer("⛔ Публиковать семинары может только староста!", show_alert=True)
         return
     seminar_id = int(callback.data.split(":")[1])
     with connect_db() as db:
-        seminar = db.execute("SELECT id, title FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
+        seminar = db.execute("SELECT id, title, group_chat_id FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
         topics = db.execute(
             "SELECT COUNT(*) FROM seminar_topics WHERE seminar_id = ?", (seminar_id,)
         ).fetchone()[0]
@@ -648,7 +865,7 @@ async def publish_seminar(callback: CallbackQuery):
             InlineKeyboardButton(text="📚 Выбрать тему семинара", url=link)
         ]])
         sent = await bot.send_message(
-            GROUP_CHAT_ID,
+            seminar["group_chat_id"],
             f"📢 ЗАПИСЬ НА СЕМИНАР ОТКРЫТА!\n\n"
             f"📚 {seminar['title']}\n"
             f"📝 Тем в списке: {topics}\n\n"
@@ -658,7 +875,7 @@ async def publish_seminar(callback: CallbackQuery):
         with connect_db() as db:
             db.execute(
                 "INSERT OR IGNORE INTO seminar_announcements (seminar_id, chat_id, message_id) VALUES (?, ?, ?)",
-                (seminar_id, GROUP_CHAT_ID, sent.message_id)
+                (seminar_id, seminar["group_chat_id"], sent.message_id)
             )
         await callback.answer("Семинар опубликован в группе! 📢")
         await callback.message.answer(f"✅ Семинар «{seminar['title']}» опубликован в группе!")
@@ -669,12 +886,12 @@ async def publish_seminar(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("seminar_delete:"))
 async def delete_seminar_confirm(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
         await callback.answer("⛔ Удалять семинары может только староста!", show_alert=True)
         return
     seminar_id = int(callback.data.split(":")[1])
     with connect_db() as db:
-        seminar = db.execute("SELECT id, title FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
+        seminar = db.execute("SELECT id, title, group_chat_id FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
     if not seminar:
         await callback.answer("Семинар уже не существует.", show_alert=True)
         return
@@ -691,12 +908,12 @@ async def delete_seminar_confirm(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("seminar_delete_yes:"))
 async def delete_seminar_execute(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+    if not user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
         await callback.answer("⛔ Только староста!", show_alert=True)
         return
     seminar_id = int(callback.data.split(":")[1])
     with connect_db() as db:
-        seminar = db.execute("SELECT id, title FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
+        seminar = db.execute("SELECT id, title, group_chat_id FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
         announcements = db.execute(
             "SELECT chat_id, message_id FROM seminar_announcements WHERE seminar_id = ?", (seminar_id,)
         ).fetchall()
@@ -894,7 +1111,7 @@ async def receive_text(message: Message):
         return
 
     if user_id in waiting_for_queue_name:
-        if user_id not in ADMIN_IDS:
+        if not user_is_group_admin(user_id, selected_group_id(user_id)):
             waiting_for_queue_name.discard(user_id)
             return
         if not text or len(text) > 100:
@@ -907,7 +1124,7 @@ async def receive_text(message: Message):
         return
 
     if user_id in waiting_for_queue_capacity:
-        if user_id not in ADMIN_IDS:
+        if not user_is_group_admin(user_id, selected_group_id(user_id)):
             waiting_for_queue_capacity.discard(user_id)
             pending_queue_name.pop(user_id, None)
             return
@@ -925,7 +1142,7 @@ async def receive_text(message: Message):
             await message.answer("Название очереди потерялось. Начни создание заново.", reply_markup=main_menu(user_id))
             return
         with connect_db() as db:
-            cursor = db.execute("INSERT INTO queues (name, places) VALUES (?, ?)", (name, capacity))
+            cursor = db.execute("INSERT INTO queues (name, places, group_chat_id) VALUES (?, ?, ?)", (name, capacity, selected_group_id(user_id)))
             queue_id = cursor.lastrowid
         waiting_for_queue_capacity.discard(user_id)
         await message.answer(f"🎉 Очередь создана! Вместимость: {capacity} участник(ов).", reply_markup=main_menu(user_id))
@@ -933,7 +1150,7 @@ async def receive_text(message: Message):
         return
 
     if user_id in waiting_for_seminar_title:
-        if user_id not in ADMIN_IDS:
+        if not user_is_group_admin(user_id, selected_group_id(user_id)):
             waiting_for_seminar_title.discard(user_id)
             return
         if not text or len(text) > 150:
@@ -946,7 +1163,7 @@ async def receive_text(message: Message):
         return
 
     if user_id in waiting_for_seminar_topics:
-        if user_id not in ADMIN_IDS:
+        if not user_is_group_admin(user_id, selected_group_id(user_id)):
             waiting_for_seminar_topics.pop(user_id, None)
             return
         if text.upper() == "ГОТОВО":
@@ -962,8 +1179,8 @@ async def receive_text(message: Message):
                 staged_topics[user_id] = []
                 return
             with connect_db() as db:
-                cursor = db.execute("INSERT INTO seminars (title, created_by, created_at) VALUES (?, ?, ?)",
-                                    (title, user_id, datetime.utcnow().isoformat(timespec="seconds")))
+                cursor = db.execute("INSERT INTO seminars (title, created_by, created_at, group_chat_id) VALUES (?, ?, ?, ?)",
+                                    (title, user_id, datetime.utcnow().isoformat(timespec="seconds"), selected_group_id(user_id)))
                 seminar_id = cursor.lastrowid
                 db.executemany("INSERT INTO seminar_topics (seminar_id, topic_name) VALUES (?, ?)", [(seminar_id, topic) for topic in topics])
             await message.answer(f"🎉 Семинар «{title}» создан: тем — {len(topics)}.", reply_markup=main_menu(user_id))
