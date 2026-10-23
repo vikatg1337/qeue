@@ -17,12 +17,15 @@ if not TOKEN:
     raise RuntimeError("Не найден токен! Проверь переменную окружения BOT_TOKEN или файл .env")
 
 # На сервере не используем локальный прокси компьютера.
-session = AiohttpSession()
+session = AiohttpSession(proxy="http://127.0.0.1:10809")
 bot = Bot(token=TOKEN, session=session)
 dp = Dispatcher()
 
 DB_FILE = os.getenv("DB_FILE", "queues.db")
-ADMIN_ID = 1053596260
+ADMIN_IDS = {
+    1053596260,
+    942790183,
+}
 GROUP_CHAT_ID = -5496142597
 
 JOKES = [
@@ -187,7 +190,7 @@ def main_menu(user_id=None):
         [InlineKeyboardButton(text="📋 Все очереди", callback_data="queues")],
         [InlineKeyboardButton(text="📚 Темы семинаров", callback_data="seminars")],
     ]
-    if user_id == ADMIN_ID:
+    if user_id in ADMIN_IDS:
         rows.append([InlineKeyboardButton(text="➕ Создать семинар", callback_data="seminar_create")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -199,7 +202,7 @@ def queues_keyboard(user_id=None):
         rows.append([InlineKeyboardButton(
             text=f"📋 {queue['name']} ({occupied}/{queue['places']})", callback_data=f"view:{queue['id']}"
         )])
-        if user_id == ADMIN_ID:
+        if user_id in ADMIN_IDS:
             rows.append([InlineKeyboardButton(
                 text=f"🗑 Удалить: {queue['name']}", callback_data=f"delete:{queue['id']}"
             )])
@@ -264,12 +267,12 @@ def seminars_keyboard(user_id=None):
         rows.append([InlineKeyboardButton(
             text=f"📚 {seminar['title']} ({taken}/{total})", callback_data=f"seminar_view:{seminar['id']}"
         )])
-        if user_id == ADMIN_ID:
+        if user_id in ADMIN_IDS:
             rows.append([
                 InlineKeyboardButton(text=f"📢 Опубликовать: {seminar['title'][:28]}", callback_data=f"seminar_publish:{seminar['id']}"),
                 InlineKeyboardButton(text=f"🗑 Удалить: {seminar['title'][:28]}", callback_data=f"seminar_delete:{seminar['id']}")
             ])
-    if user_id == ADMIN_ID:
+    if user_id in ADMIN_IDS:
         rows.append([InlineKeyboardButton(text="➕ Создать семинар", callback_data="seminar_create")])
     rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -278,7 +281,7 @@ def seminars_keyboard(user_id=None):
 def seminar_topics_keyboard(seminar_id):
     with connect_db() as db:
         topics = db.execute(
-            "SELECT id, topic_name, user_name, user_id FROM seminar_topics WHERE seminar_id = ? ORDER BY id",
+            "SELECT id, topic_name, user_name FROM seminar_topics WHERE seminar_id = ? ORDER BY id",
             (seminar_id,),
         ).fetchall()
     rows = []
@@ -313,7 +316,7 @@ async def start(message: Message):
                 seminar = db.execute("SELECT id, title FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
             if seminar:
                 await message.answer(
-                    f"📚 Семинар: {seminar['title']}\nНажми на свободную тему, чтобы занять её.",
+                    f"📚 {seminar['title']}\nНажми на свободную тему, чтобы занять её.",
                     reply_markup=seminar_topics_keyboard(seminar_id)
                 )
             else:
@@ -326,14 +329,14 @@ async def start(message: Message):
             queue_id = 0
         if queue_id:
             if get_queue(queue_id):
-                await message.answer("📩 Ты прибыл по секретной ссылке старосты!\nДобро пожаловать в академический хаос ☠️")
+                await message.answer("📩 Ты прибыл по секретной ссылке старосты!\nДобро пожаловать!")
                 await message.answer(queue_text(queue_id), reply_markup=queue_keyboard(queue_id))
             else:
                 await message.answer("👽 Эта очередь не найдена. Возможно, её уже удалили.")
             return
     await message.answer(
-        "🤖 ВИКИН БОТ 3000 (название не я придумала)\n\n"
-        "короче Вика навайбкодила бота такая она крутая ну!\n"
+        "🤖 БОТ 3000 (название не я придумала)\n\n"
+        "короче Вика сделала бота такая она крутая ну!\n"
         "Короче очередь занимаем электронная не толпимся ноги поднимаем\n\nВыбирай действие:",
         reply_markup=main_menu(message.from_user.id),
     )
@@ -347,12 +350,13 @@ async def home(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "create")
 async def create_queue_start(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    print("ADMIN CHECK:", callback.from_user.id, ADMIN_IDS)  # ← ВСТАВЬ ЭТУ СТРОКУ
+    if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("⛔ Создавать очереди может только староста!", show_alert=True)
         return
     waiting_for_queue_name.add(callback.from_user.id)
     await callback.answer()
-    await callback.message.answer("Режим старосты активирован!\nКак назовём новую очередь? Напиши название сообщением. Для отмены — /cancel.")
+    await callback.message.answer("Привет староста!\nКак назовём новую очередь? Напиши название сообщением. Для отмены — /cancel.")
 
 
 @dp.callback_query(F.data == "queues")
@@ -466,7 +470,7 @@ async def change_booking(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("delete:"))
 async def delete_queue_confirm(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("⛔ Только староста может удалять очереди!", show_alert=True)
         return
     queue_id = int(callback.data.split(":")[1])
@@ -484,7 +488,7 @@ async def delete_queue_confirm(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("delete_yes:"))
 async def delete_queue_execute(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("⛔ Только староста!", show_alert=True)
         return
     queue_id = int(callback.data.split(":")[1])
@@ -494,14 +498,14 @@ async def delete_queue_execute(callback: CallbackQuery):
         cursor = db.execute("DELETE FROM queues WHERE id = ?", (queue_id,))
     await callback.answer()
     if cursor.rowcount:
-        await callback.message.answer("💥 Очередь удалена. Одной академической проблемой меньше.", reply_markup=main_menu(callback.from_user.id))
+        await callback.message.answer("💥 Очередь удалена. Одной проблемой меньше.", reply_markup=main_menu(callback.from_user.id))
     else:
         await callback.message.answer("Очередь уже удалена.")
 
 
 @dp.callback_query(F.data.startswith("publish:"))
 async def publish_queue(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("⛔ Публиковать очереди может только староста!", show_alert=True)
         return
     queue_id = int(callback.data.split(":")[1])
@@ -541,7 +545,7 @@ async def show_seminars(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "seminar_create")
 async def seminar_create_start(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("⛔ Создавать семинары может только староста!", show_alert=True)
         return
     waiting_for_seminar_title.add(callback.from_user.id)
@@ -549,9 +553,25 @@ async def seminar_create_start(callback: CallbackQuery):
     await callback.message.answer("➕ Напиши название семинара или предмета. Например: «История искусства — семинар 2».")
 
 
+@dp.callback_query(F.data.startswith("seminar_view:"))
+async def seminar_view(callback: CallbackQuery):
+    seminar_id = int(callback.data.split(":")[1])
+    with connect_db() as db:
+        seminar = db.execute("SELECT id, title FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
+        count = db.execute("SELECT COUNT(*) FROM seminar_topics WHERE seminar_id = ?", (seminar_id,)).fetchone()[0]
+    await callback.answer()
+    if not seminar:
+        await callback.message.answer("Этот семинар не найден.")
+        return
+    if count == 0:
+        await callback.message.answer(f"📚 {seminar['title']}\nПока тем нет.")
+        return
+    await callback.message.answer(f"📚 {seminar['title']}\nНажми на свободную тему, чтобы занять её.", reply_markup=seminar_topics_keyboard(seminar_id))
+
+
 @dp.callback_query(F.data.startswith("seminar_publish:"))
 async def publish_seminar(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("⛔ Публиковать семинары может только староста!", show_alert=True)
         return
     seminar_id = int(callback.data.split(":")[1])
@@ -594,7 +614,7 @@ async def publish_seminar(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("seminar_delete:"))
 async def delete_seminar_confirm(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("⛔ Удалять семинары может только староста!", show_alert=True)
         return
     seminar_id = int(callback.data.split(":")[1])
@@ -616,7 +636,7 @@ async def delete_seminar_confirm(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("seminar_delete_yes:"))
 async def delete_seminar_execute(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("⛔ Только староста!", show_alert=True)
         return
     seminar_id = int(callback.data.split(":")[1])
@@ -641,22 +661,6 @@ async def delete_seminar_execute(callback: CallbackQuery):
         f"💥 Семинар «{seminar['title']}» удалён вместе с темами и записями.",
         reply_markup=seminars_keyboard(callback.from_user.id)
     )
-
-
-@dp.callback_query(F.data.startswith("seminar_view:"))
-async def seminar_view(callback: CallbackQuery):
-    seminar_id = int(callback.data.split(":")[1])
-    with connect_db() as db:
-        seminar = db.execute("SELECT id, title FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
-        count = db.execute("SELECT COUNT(*) FROM seminar_topics WHERE seminar_id = ?", (seminar_id,)).fetchone()[0]
-    await callback.answer()
-    if not seminar:
-        await callback.message.answer("Этот семинар не найден.")
-        return
-    if count == 0:
-        await callback.message.answer(f"📚 {seminar['title']}\nПока тем нет.")
-        return
-    await callback.message.answer(f"📚 {seminar['title']}\nНажми на свободную тему, чтобы занять её.", reply_markup=seminar_topics_keyboard(seminar_id))
 
 
 @dp.callback_query(F.data.startswith("topic_book:"))
@@ -799,7 +803,7 @@ async def receive_text(message: Message):
         return
 
     if user_id in waiting_for_queue_name:
-        if user_id != ADMIN_ID:
+        if user_id not in ADMIN_IDS:
             waiting_for_queue_name.discard(user_id)
             return
         if not text or len(text) > 100:
@@ -812,7 +816,7 @@ async def receive_text(message: Message):
         return
 
     if user_id in waiting_for_queue_capacity:
-        if user_id != ADMIN_ID:
+        if user_id not in ADMIN_IDS:
             waiting_for_queue_capacity.discard(user_id)
             pending_queue_name.pop(user_id, None)
             return
@@ -838,7 +842,7 @@ async def receive_text(message: Message):
         return
 
     if user_id in waiting_for_seminar_title:
-        if user_id != ADMIN_ID:
+        if user_id not in ADMIN_IDS:
             waiting_for_seminar_title.discard(user_id)
             return
         if not text or len(text) > 150:
@@ -851,7 +855,7 @@ async def receive_text(message: Message):
         return
 
     if user_id in waiting_for_seminar_topics:
-        if user_id != ADMIN_ID:
+        if user_id not in ADMIN_IDS:
             waiting_for_seminar_topics.pop(user_id, None)
             return
         if text.upper() == "ГОТОВО":
