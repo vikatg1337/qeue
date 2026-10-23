@@ -22,7 +22,6 @@ bot = Bot(token=TOKEN, session=session)
 dp = Dispatcher()
 
 DB_FILE = os.getenv("DB_FILE", "queues.db")
-PLACES = 32
 ADMIN_ID = 1053596260
 GROUP_CHAT_ID = -5496142597
 
@@ -37,6 +36,8 @@ JOKES = [
 
 # Простые состояния диалога. Они хранятся в памяти до перезапуска бота.
 waiting_for_queue_name = set()
+waiting_for_queue_capacity = set()
+pending_queue_name = {}
 waiting_for_change = set()
 waiting_for_change_queue = {}
 waiting_for_proxy_name = {}       # user_id -> (queue_id, place)
@@ -56,9 +57,13 @@ def init_db():
         db.execute("""
             CREATE TABLE IF NOT EXISTS queues (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL
+                name TEXT NOT NULL,
+                places INTEGER NOT NULL DEFAULT 32
             )
         """)
+        queue_columns = {row[1] for row in db.execute("PRAGMA table_info(queues)").fetchall()}
+        if "places" not in queue_columns:
+            db.execute("ALTER TABLE queues ADD COLUMN places INTEGER NOT NULL DEFAULT 32")
         db.execute("""
             CREATE TABLE IF NOT EXISTS bookings (
                 queue_id INTEGER NOT NULL,
@@ -110,12 +115,12 @@ def init_db():
 
 def get_queues():
     with connect_db() as db:
-        return db.execute("SELECT id, name FROM queues ORDER BY id DESC").fetchall()
+        return db.execute("SELECT id, name, places FROM queues ORDER BY id DESC").fetchall()
 
 
 def get_queue(queue_id):
     with connect_db() as db:
-        return db.execute("SELECT id, name FROM queues WHERE id = ?", (queue_id,)).fetchone()
+        return db.execute("SELECT id, name, places FROM queues WHERE id = ?", (queue_id,)).fetchone()
 
 
 def get_bookings(queue_id):
@@ -139,7 +144,7 @@ async def update_queue_announcement(queue_id):
     if not queue:
         return
     bookings = get_bookings(queue_id)
-    free_places = PLACES - len(bookings)
+    free_places = queue["places"] - len(bookings)
     with connect_db() as db:
         announcements = db.execute(
             "SELECT chat_id, message_id FROM announcements WHERE queue_id = ?", (queue_id,)
@@ -158,7 +163,7 @@ async def update_queue_announcement(queue_id):
                 text=(
                     "📢 ОБЪЯВЛЕНА НОВАЯ ОЧЕРЕДЬ!\n\n"
                     f"📚 {queue['name']}\n\n"
-                    f"🟢 Свободно мест: {free_places}/{PLACES}\n\n"
+                    f"🟢 Свободно мест: {free_places}/{queue['places']}\n\n"
                     "🎓 Выбирайте свободное место в боте.\n"
                     "💀 Не тяните до последней минуты!"
                 ),
@@ -184,7 +189,7 @@ def queues_keyboard(user_id=None):
     for queue in get_queues():
         occupied = len(get_bookings(queue["id"]))
         rows.append([InlineKeyboardButton(
-            text=f"📋 {queue['name']} ({occupied}/{PLACES})", callback_data=f"view:{queue['id']}"
+            text=f"📋 {queue['name']} ({occupied}/{queue['places']})", callback_data=f"view:{queue['id']}"
         )])
         if user_id == ADMIN_ID:
             rows.append([InlineKeyboardButton(
@@ -198,9 +203,12 @@ def queues_keyboard(user_id=None):
 
 
 def queue_keyboard(queue_id):
+    queue = get_queue(queue_id)
+    if not queue:
+        return InlineKeyboardMarkup(inline_keyboard=[])
     bookings = {row["place"] for row in get_bookings(queue_id)}
     rows, row = [], []
-    for place in range(1, PLACES + 1):
+    for place in range(1, queue["places"] + 1):
         label = f"🔴 {place}" if place in bookings else f"🟢 {place}"
         row.append(InlineKeyboardButton(text=label, callback_data=f"place:{queue_id}:{place}"))
         if len(row) == 4:
@@ -222,17 +230,18 @@ def queue_text(queue_id):
     if not queue:
         return "🛸 Очередь похищена инопланетянами. Не найдена."
     bookings = {row["place"]: row["user_name"] for row in get_bookings(queue_id)}
-    free = PLACES - len(bookings)
+    capacity = queue["places"]
+    free = capacity - len(bookings)
     lines = [
         f"📋 {queue['name']}", random.choice(JOKES), "",
-        f"🔴 Занято: {len(bookings)}/{PLACES}", f"🟢 Свободно: {free}", "",
+        f"🔴 Занято: {len(bookings)}/{capacity}", f"🟢 Свободно: {free}", "",
     ]
-    for place in range(1, PLACES + 1):
+    for place in range(1, capacity + 1):
         if place in bookings:
             lines.append(f"🔴 № {place} — {bookings[place]}")
         else:
             lines.append(f"🟢 № {place} — свободно, пока жизнь не настигла")
-    lines.extend(["", "👇 Выбирай свободное место. Если записываешь другого человека, выбери номер, а потом укажи его имя."])
+    lines.extend(["", "👇 Выбирай свободное место. Если записываешь другого человека, укажи его имя."])
     return "\n".join(lines)
 
 
@@ -314,7 +323,7 @@ async def create_queue_start(callback: CallbackQuery):
         return
     waiting_for_queue_name.add(callback.from_user.id)
     await callback.answer()
-    await callback.message.answer("Режим старосты активирован!\nКак назовём новую очередь? Напиши название сообщением.")
+    await callback.message.answer("Режим старосты активирован!\nКак назовём новую очередь? Напиши название сообщением. Для отмены — /cancel.")
 
 
 @dp.callback_query(F.data == "queues")
@@ -340,7 +349,7 @@ async def choose_place(callback: CallbackQuery):
     if not get_queue(queue_id):
         await callback.answer("Очередь не найдена 👽", show_alert=True)
         return
-    if not 1 <= place <= PLACES:
+    if not 1 <= place <= get_queue(queue_id)["places"]:
         await callback.answer("Такого места нет.", show_alert=True)
         return
     with connect_db() as db:
@@ -361,6 +370,10 @@ async def choose_place(callback: CallbackQuery):
 async def book_self(callback: CallbackQuery):
     _, q_text, p_text = callback.data.split(":")
     queue_id, place = int(q_text), int(p_text)
+    queue = get_queue(queue_id)
+    if not queue or not 1 <= place <= queue["places"]:
+        await callback.answer("Такого места нет или очередь удалена.", show_alert=True)
+        return
     user_id = callback.from_user.id
     user_name = callback.from_user.full_name or "Участник"
     try:
@@ -379,6 +392,10 @@ async def book_self(callback: CallbackQuery):
 async def book_other_start(callback: CallbackQuery):
     _, q_text, p_text = callback.data.split(":")
     queue_id, place = int(q_text), int(p_text)
+    queue = get_queue(queue_id)
+    if not queue or not 1 <= place <= queue["places"]:
+        await callback.answer("Такого места нет или очередь удалена.", show_alert=True)
+        return
     with connect_db() as db:
         taken = db.execute("SELECT 1 FROM bookings WHERE queue_id = ? AND place = ?", (queue_id, place)).fetchone()
     if taken:
@@ -415,7 +432,7 @@ async def change_booking(callback: CallbackQuery):
     waiting_for_change.add(user_id)
     waiting_for_change_queue[user_id] = queue_id
     await callback.answer()
-    await callback.message.answer("🔄 На какой номер пересаживаемся? Напиши число от 1 до 32. Если место занято, запись не изменится.")
+    await callback.message.answer(f"🔄 На какой номер пересаживаемся? Напиши число от 1 до {get_queue(queue_id)['places']}. Если место занято, запись не изменится.")
 
 
 @dp.callback_query(F.data.startswith("delete:"))
@@ -473,7 +490,7 @@ async def publish_queue(callback: CallbackQuery):
         sent_message = await bot.send_message(
             GROUP_CHAT_ID,
             f"📢 ОБЪЯВЛЕНА НОВАЯ ОЧЕРЕДЬ!\n\n📚 {queue['name']}\n\n"
-            f"🟢 Свободно мест: {PLACES - len(get_bookings(queue_id))}/{PLACES}\n\n"
+            f"🟢 Свободно мест: {queue['places'] - len(get_bookings(queue_id))}/{queue['places']}\n\n"
             "🎓 Выбирайте свободное место в боте.\n💀 Не тяните до последней минуты!",
             reply_markup=keyboard,
         )
@@ -568,6 +585,8 @@ async def receive_text(message: Message):
         waiting_for_change.discard(user_id)
         waiting_for_change_queue.pop(user_id, None)
         waiting_for_queue_name.discard(user_id)
+        waiting_for_queue_capacity.discard(user_id)
+        pending_queue_name.pop(user_id, None)
         waiting_for_seminar_title.discard(user_id)
         waiting_for_seminar_topics.pop(user_id, None)
         staged_topics.pop(user_id, None)
@@ -618,15 +637,21 @@ async def receive_text(message: Message):
         try:
             place = int(text)
         except ValueError:
-            await message.answer("🤨 Введи номер цифрами от 1 до 32.")
+            await message.answer("🤨 Введи номер места цифрами.")
             return
         queue_id = waiting_for_change_queue.get(user_id)
         if queue_id is None:
             waiting_for_change.discard(user_id)
             await message.answer("Смена места отменена. Попробуй заново.")
             return
-        if not 1 <= place <= PLACES:
-            await message.answer("Номер должен быть от 1 до 32.")
+        queue = get_queue(queue_id) if queue_id is not None else None
+        if not queue:
+            waiting_for_change.discard(user_id)
+            waiting_for_change_queue.pop(user_id, None)
+            await message.answer("Очередь больше не существует.")
+            return
+        if not 1 <= place <= queue["places"]:
+            await message.answer(f"Номер должен быть от 1 до {queue['places']}.")
             return
         current = get_user_booking(queue_id, user_id)
         if not current:
@@ -657,11 +682,35 @@ async def receive_text(message: Message):
         if not text or len(text) > 100:
             await message.answer("Название должно быть от 1 до 100 символов.")
             return
-        with connect_db() as db:
-            cursor = db.execute("INSERT INTO queues (name) VALUES (?)", (text,))
-            queue_id = cursor.lastrowid
         waiting_for_queue_name.discard(user_id)
-        await message.answer("🎉 Очередь создана! Администрация довольна.", reply_markup=main_menu(user_id))
+        pending_queue_name[user_id] = text
+        waiting_for_queue_capacity.add(user_id)
+        await message.answer("🔢 Сколько участников должно быть в очереди? Напиши число от 1 до 200. Например, 32. Для отмены — /cancel.")
+        return
+
+    if user_id in waiting_for_queue_capacity:
+        if user_id != ADMIN_ID:
+            waiting_for_queue_capacity.discard(user_id)
+            pending_queue_name.pop(user_id, None)
+            return
+        try:
+            capacity = int(text)
+        except ValueError:
+            await message.answer("Нужно написать целое число от 1 до 200. Попробуй ещё раз.")
+            return
+        if not 1 <= capacity <= 200:
+            await message.answer("Количество участников должно быть от 1 до 200. Попробуй ещё раз.")
+            return
+        name = pending_queue_name.pop(user_id, None)
+        if not name:
+            waiting_for_queue_capacity.discard(user_id)
+            await message.answer("Название очереди потерялось. Начни создание заново.", reply_markup=main_menu(user_id))
+            return
+        with connect_db() as db:
+            cursor = db.execute("INSERT INTO queues (name, places) VALUES (?, ?)", (name, capacity))
+            queue_id = cursor.lastrowid
+        waiting_for_queue_capacity.discard(user_id)
+        await message.answer(f"🎉 Очередь создана! Вместимость: {capacity} участник(ов).", reply_markup=main_menu(user_id))
         await message.answer(queue_text(queue_id), reply_markup=queue_keyboard(queue_id))
         return
 
@@ -718,10 +767,6 @@ async def main():
     init_db()
     print(f"Бот запускается... База данных: {os.path.abspath(DB_FILE)}")
     await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
 
 
 if __name__ == "__main__":
