@@ -12,9 +12,9 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from dotenv import load_dotenv
 
 load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("BOT2_TOKEN")
 if not TOKEN:
-    raise RuntimeError("Не найден токен! Проверь переменную окружения BOT_TOKEN или файл .env")
+    raise RuntimeError("Не найден токен! Проверь переменную окружения BOT2_TOKEN или файл .env")
 
 # На сервере не используем локальный прокси компьютера.
 session = AiohttpSession(proxy="http://127.0.0.1:10809")
