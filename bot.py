@@ -119,10 +119,28 @@ def init_db():
                 PRIMARY KEY (seminar_id, chat_id, message_id)
             )
         """)
+        # Отдельная таблица записей позволяет нескольким людям выбрать одну тему.
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS seminar_topic_bookings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                user_name TEXT NOT NULL,
+                booked_at TEXT NOT NULL,
+                UNIQUE(topic_id, user_id),
+                FOREIGN KEY (topic_id) REFERENCES seminar_topics(id)
+            )
+        """)
         db.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_one_topic_per_user_per_seminar
             ON seminar_topics(seminar_id, user_id) WHERE user_id IS NOT NULL
         """)
+        # Переносим старые записи в новую таблицу, не удаляя их из старой.
+        db.execute("""
+            INSERT OR IGNORE INTO seminar_topic_bookings (topic_id, user_id, user_name, booked_at)
+            SELECT id, user_id, user_name, COALESCE(booked_at, ?)
+            FROM seminar_topics WHERE user_id IS NOT NULL
+        """, (datetime.utcnow().isoformat(timespec="seconds"),))
 
 
 def get_queues():
@@ -264,7 +282,12 @@ def seminars_keyboard(user_id=None):
     for seminar in seminars:
         with connect_db() as db:
             total = db.execute("SELECT COUNT(*) FROM seminar_topics WHERE seminar_id = ?", (seminar["id"],)).fetchone()[0]
-            taken = db.execute("SELECT COUNT(*) FROM seminar_topics WHERE seminar_id = ? AND user_id IS NOT NULL", (seminar["id"],)).fetchone()[0]
+            taken = db.execute("""
+                SELECT COUNT(DISTINCT st.id)
+                FROM seminar_topics st
+                LEFT JOIN seminar_topic_bookings b ON b.topic_id = st.id
+                WHERE st.seminar_id = ? AND (b.id IS NOT NULL OR st.user_id IS NOT NULL)
+            """, (seminar["id"],)).fetchone()[0]
         rows.append([InlineKeyboardButton(
             text=f"📚 {seminar['title']} ({taken}/{total})", callback_data=f"seminar_view:{seminar['id']}"
         )])
@@ -285,23 +308,31 @@ def seminar_topics_keyboard(seminar_id):
     with connect_db() as db:
         topics = db.execute(
             """
-            SELECT id, seminar_id, topic_name, user_id, user_name
-            FROM seminar_topics
-            WHERE seminar_id = ?
-            ORDER BY id
+            SELECT st.id, st.seminar_id, st.topic_name,
+                   GROUP_CONCAT(b.user_name, ', ') AS booked_names,
+                   COUNT(b.id) AS booking_count,
+                   st.user_id, st.user_name
+            FROM seminar_topics st
+            LEFT JOIN seminar_topic_bookings b ON b.topic_id = st.id
+            WHERE st.seminar_id = ?
+            GROUP BY st.id
+            ORDER BY st.id
             """,
             (seminar_id,),
         ).fetchall()
 
     rows = []
     for topic in topics:
-        if topic["user_id"] is None:
-            label = f"🟢 {topic['topic_name']} — свободна"
-            callback = f"topic_book:{topic['id']}"
+        names = topic["booked_names"]
+        # Для старых записей, до миграции, показываем прежнего участника.
+        if not names and topic["user_id"] is not None:
+            names = topic["user_name"] or "Участник"
+        if names:
+            label = f"🔴 {topic['topic_name']} ({topic['booking_count'] or 1}): {names}"
         else:
-            label = f"🔴 {topic['topic_name']} — {topic['user_name']}"
-            callback = f"topic_taken:{topic['id']}"
-        rows.append([InlineKeyboardButton(text=label[:60], callback_data=callback)])
+            label = f"🟢 {topic['topic_name']} — записаться"
+        # Тему можно выбрать даже если на неё уже записались другие.
+        rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"topic_book:{topic['id']}")])
 
     rows.append([InlineKeyboardButton(text="❌ Снять мою тему", callback_data=f"topic_cancel:{seminar_id}")])
     rows.append([InlineKeyboardButton(text="⬅️ К семинарам", callback_data="seminars")])
@@ -672,6 +703,7 @@ async def delete_seminar_execute(callback: CallbackQuery):
         if not seminar:
             await callback.answer("Семинар уже удалён.", show_alert=True)
             return
+        db.execute("DELETE FROM seminar_topic_bookings WHERE topic_id IN (SELECT id FROM seminar_topics WHERE seminar_id = ?)", (seminar_id,))
         db.execute("DELETE FROM seminar_topics WHERE seminar_id = ?", (seminar_id,))
         db.execute("DELETE FROM seminar_announcements WHERE seminar_id = ?", (seminar_id,))
         db.execute("DELETE FROM seminars WHERE id = ?", (seminar_id,))
@@ -692,49 +724,69 @@ async def topic_book(callback: CallbackQuery):
     topic_id = int(callback.data.split(":")[1])
     user_id = callback.from_user.id
     with connect_db() as db:
-        topic = db.execute("SELECT id, seminar_id, topic_name, user_id FROM seminar_topics WHERE id = ?", (topic_id,)).fetchone()
+        topic = db.execute(
+            "SELECT id, seminar_id, topic_name FROM seminar_topics WHERE id = ?", (topic_id,)
+        ).fetchone()
         if not topic:
             await callback.answer("Тема не найдена.", show_alert=True)
             return
-        if topic["user_id"] is not None:
-            await callback.answer("Эту тему уже заняли. Обнови список.", show_alert=True)
-            return
-        existing = db.execute("SELECT topic_name FROM seminar_topics WHERE seminar_id = ? AND user_id = ?", (topic["seminar_id"], user_id)).fetchone()
+
+        # Один человек может выбрать только одну тему в рамках семинара.
+        existing = db.execute("""
+            SELECT st.topic_name
+            FROM seminar_topic_bookings b
+            JOIN seminar_topics st ON st.id = b.topic_id
+            WHERE st.seminar_id = ? AND b.user_id = ?
+            LIMIT 1
+        """, (topic["seminar_id"], user_id)).fetchone()
+        if not existing:
+            # Совместимость со старой записью, если она ещё не перенеслась.
+            existing = db.execute(
+                "SELECT topic_name FROM seminar_topics WHERE seminar_id = ? AND user_id = ?",
+                (topic["seminar_id"], user_id),
+            ).fetchone()
         if existing:
-            await callback.answer(f"Ты уже выбрал(а) тему: {existing['topic_name']}", show_alert=True)
+            if existing["topic_name"] == topic["topic_name"]:
+                await callback.answer("Ты уже записан(а) на эту тему!", show_alert=True)
+            else:
+                await callback.answer(f"Ты уже выбрал(а) тему: {existing['topic_name']}", show_alert=True)
             return
+
         try:
-            cursor = db.execute(
-                "UPDATE seminar_topics SET user_id = ?, user_name = ?, booked_at = ? "
-                "WHERE id = ? AND user_id IS NULL",
-                (user_id, callback.from_user.full_name or "Участник",
-                 datetime.utcnow().isoformat(timespec="seconds"), topic_id),
+            db.execute(
+                "INSERT INTO seminar_topic_bookings (topic_id, user_id, user_name, booked_at) VALUES (?, ?, ?, ?)",
+                (topic_id, user_id, callback.from_user.full_name or "Участник",
+                 datetime.utcnow().isoformat(timespec="seconds")),
             )
         except sqlite3.IntegrityError:
-            # Защита ограничения БД: один участник — одна тема в рамках семинара.
-            await callback.answer("Ты уже выбрал(а) другую тему этого семинара.", show_alert=True)
+            await callback.answer("Ты уже записан(а) на эту тему!", show_alert=True)
             return
-        if cursor.rowcount != 1:
-            await callback.answer("Эту тему только что заняли. Обнови список.", show_alert=True)
-            return
-    await callback.answer("🎉 Тема за тобой!")
-    await callback.message.answer("Тема занята!", reply_markup=seminar_topics_keyboard(topic["seminar_id"]))
 
-
-@dp.callback_query(F.data.startswith("topic_taken:"))
-async def topic_taken(callback: CallbackQuery):
-    await callback.answer("Эта тема уже занята. Выбери свободную 🫡", show_alert=True)
+    await callback.answer("🎉 Записала тебя на тему!")
+    await callback.message.answer(
+        f"Тема «{topic['topic_name']}» — запись добавлена.",
+        reply_markup=seminar_topics_keyboard(topic["seminar_id"]),
+    )
 
 
 @dp.callback_query(F.data.startswith("topic_cancel:"))
 async def topic_cancel(callback: CallbackQuery):
     seminar_id = int(callback.data.split(":")[1])
     with connect_db() as db:
-        cursor = db.execute("UPDATE seminar_topics SET user_id = NULL, user_name = NULL, booked_at = NULL WHERE seminar_id = ? AND user_id = ?",
-                            (seminar_id, callback.from_user.id))
+        cursor = db.execute("""
+            DELETE FROM seminar_topic_bookings
+            WHERE user_id = ? AND topic_id IN (
+                SELECT id FROM seminar_topics WHERE seminar_id = ?
+            )
+        """, (callback.from_user.id, seminar_id))
+        # Если это старая запись, до миграции/переноса, тоже снимаем её.
+        legacy = db.execute(
+            "UPDATE seminar_topics SET user_id = NULL, user_name = NULL, booked_at = NULL WHERE seminar_id = ? AND user_id = ?",
+            (seminar_id, callback.from_user.id),
+        )
     await callback.answer()
-    if cursor.rowcount:
-        await callback.message.answer("🫡 Твоя тема снова свободна.", reply_markup=seminar_topics_keyboard(seminar_id))
+    if cursor.rowcount or legacy.rowcount:
+        await callback.message.answer("🫡 Твоя запись снята. Остальные участники остаются записанными.", reply_markup=seminar_topics_keyboard(seminar_id))
     else:
         await callback.message.answer("У тебя нет выбранной темы в этом семинаре.")
 
