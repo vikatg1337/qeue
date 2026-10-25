@@ -28,7 +28,8 @@ dp = Dispatcher()
 DB_FILE = os.getenv("DB_FILE", "queues.db")
 ADMIN_IDS = {
     1053596260,
-    942790183
+    942790183,
+    1214767790
 }
 LEGACY_GROUP_CHAT_ID = -5496142597  # группа старого бота; её данные сохраняются
 
