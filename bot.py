@@ -217,6 +217,15 @@ def user_is_group_admin(user_id, chat_id):
         ).fetchone() is not None
 
 
+def is_admin(user_id, chat_id=None):
+    """Global bot admins are always admins; other admins are scoped to their registered group."""
+    if user_id in ADMIN_IDS:
+        return True
+    if chat_id is None:
+        chat_id = selected_group_id(user_id)
+    return user_is_group_admin(user_id, chat_id)
+
+
 async def verify_group_member(user_id, chat_id):
     try:
         member = await bot.get_chat_member(chat_id, user_id)
@@ -377,7 +386,7 @@ def main_menu(user_id=None):
         [InlineKeyboardButton(text="📚 Темы семинаров", callback_data="seminars")],
         [InlineKeyboardButton(text="🏫 Выбрать учебную группу (/groups)", callback_data="groups_help")],
     ]
-    if user_id is not None and user_is_group_admin(user_id, selected_group_id(user_id)):
+    if user_id is not None and is_admin(user_id, selected_group_id(user_id)):
         rows.append([InlineKeyboardButton(text="➕ Создать семинар", callback_data="seminar_create")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -389,7 +398,7 @@ def queues_keyboard(user_id=None):
         rows.append([InlineKeyboardButton(
             text=f"📋 {queue['name']} ({occupied}/{queue['places']})", callback_data=f"view:{queue['id']}"
         )])
-        if user_id is not None and user_is_group_admin(user_id, selected_group_id(user_id)):
+        if user_id is not None and is_admin(user_id, selected_group_id(user_id)):
             rows.append([InlineKeyboardButton(
                 text=f"🗑 Удалить: {queue['name']}", callback_data=f"delete:{queue['id']}"
             )])
@@ -459,12 +468,12 @@ def seminars_keyboard(user_id=None):
         rows.append([InlineKeyboardButton(
             text=f"📚 {seminar['title']} ({taken}/{total})", callback_data=f"seminar_view:{seminar['id']}"
         )])
-        if user_id is not None and user_is_group_admin(user_id, selected_group_id(user_id)):
+        if user_id is not None and is_admin(user_id, selected_group_id(user_id)):
             rows.append([
                 InlineKeyboardButton(text=f"📢 Опубликовать: {seminar['title'][:28]}", callback_data=f"seminar_publish:{seminar['id']}"),
                 InlineKeyboardButton(text=f"🗑 Удалить: {seminar['title'][:28]}", callback_data=f"seminar_delete:{seminar['id']}")
             ])
-    if user_id is not None and user_is_group_admin(user_id, selected_group_id(user_id)):
+    if user_id is not None and is_admin(user_id, selected_group_id(user_id)):
         rows.append([InlineKeyboardButton(text="➕ Создать семинар", callback_data="seminar_create")])
     rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -700,8 +709,11 @@ async def home(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "create")
 async def create_queue_start(callback: CallbackQuery):
-    print("ADMIN CHECK:", callback.from_user.id, ADMIN_IDS)  # ← ВСТАВЬ ЭТУ СТРОКУ
-    if not user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
+    print("ADMIN CHECK:", callback.from_user.id,
+          "global_admin=", callback.from_user.id in ADMIN_IDS,
+          "selected_group=", selected_group_id(callback.from_user.id),
+          "group_admin=", user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)))
+    if not is_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
         await callback.answer("⛔ Создавать очереди может только староста!", show_alert=True)
         return
     waiting_for_queue_name.add(callback.from_user.id)
@@ -820,7 +832,7 @@ async def change_booking(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("delete:"))
 async def delete_queue_confirm(callback: CallbackQuery):
-    if not user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
+    if not is_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
         await callback.answer("⛔ Только староста может удалять очереди!", show_alert=True)
         return
     queue_id = int(callback.data.split(":")[1])
@@ -838,7 +850,7 @@ async def delete_queue_confirm(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("delete_yes:"))
 async def delete_queue_execute(callback: CallbackQuery):
-    if not user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
+    if not is_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
         await callback.answer("⛔ Только староста!", show_alert=True)
         return
     queue_id = int(callback.data.split(":")[1])
@@ -873,7 +885,7 @@ async def delete_queue_execute(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("publish:"))
 async def publish_queue(callback: CallbackQuery):
-    if not user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
+    if not is_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
         await callback.answer("⛔ Публиковать очереди может только староста! сорян( если вы староста обратитесь к Вике", show_alert=True)
         return
     queue_id = int(callback.data.split(":")[1])
@@ -913,7 +925,7 @@ async def show_seminars(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "seminar_create")
 async def seminar_create_start(callback: CallbackQuery):
-    if not user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
+    if not is_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
         await callback.answer("⛔ Создавать семинары может только староста!", show_alert=True)
         return
     waiting_for_seminar_title.add(callback.from_user.id)
@@ -939,7 +951,7 @@ async def seminar_view(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("seminar_publish:"))
 async def publish_seminar(callback: CallbackQuery):
-    if not user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
+    if not is_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
         await callback.answer("⛔ Публиковать семинары может только староста!", show_alert=True)
         return
     seminar_id = int(callback.data.split(":")[1])
@@ -980,7 +992,7 @@ async def publish_seminar(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("seminar_delete:"))
 async def delete_seminar_confirm(callback: CallbackQuery):
-    if not user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
+    if not is_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
         await callback.answer("⛔ Удалять семинары может только староста!", show_alert=True)
         return
     seminar_id = int(callback.data.split(":")[1])
@@ -1002,7 +1014,7 @@ async def delete_seminar_confirm(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("seminar_delete_yes:"))
 async def delete_seminar_execute(callback: CallbackQuery):
-    if not user_is_group_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
+    if not is_admin(callback.from_user.id, selected_group_id(callback.from_user.id)):
         await callback.answer("⛔ Только староста!", show_alert=True)
         return
     seminar_id = int(callback.data.split(":")[1])
@@ -1213,7 +1225,7 @@ async def receive_text(message: Message):
         return
 
     if user_id in waiting_for_queue_name:
-        if not user_is_group_admin(user_id, selected_group_id(user_id)):
+        if not is_admin(user_id, selected_group_id(user_id)):
             waiting_for_queue_name.discard(user_id)
             return
         if not text or len(text) > 100:
@@ -1226,7 +1238,7 @@ async def receive_text(message: Message):
         return
 
     if user_id in waiting_for_queue_capacity:
-        if not user_is_group_admin(user_id, selected_group_id(user_id)):
+        if not is_admin(user_id, selected_group_id(user_id)):
             waiting_for_queue_capacity.discard(user_id)
             pending_queue_name.pop(user_id, None)
             return
@@ -1252,7 +1264,7 @@ async def receive_text(message: Message):
         return
 
     if user_id in waiting_for_seminar_title:
-        if not user_is_group_admin(user_id, selected_group_id(user_id)):
+        if not is_admin(user_id, selected_group_id(user_id)):
             waiting_for_seminar_title.discard(user_id)
             return
         if not text or len(text) > 150:
@@ -1265,7 +1277,7 @@ async def receive_text(message: Message):
         return
 
     if user_id in waiting_for_seminar_topics:
-        if not user_is_group_admin(user_id, selected_group_id(user_id)):
+        if not is_admin(user_id, selected_group_id(user_id)):
             waiting_for_seminar_topics.pop(user_id, None)
             return
         if text.upper() == "ГОТОВО":
