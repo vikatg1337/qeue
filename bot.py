@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram import BaseMiddleware
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import CommandStart, Command
@@ -350,8 +351,22 @@ async def update_queue_announcement(queue_id):
                 ),
                 reply_markup=keyboard,
             )
+        except TelegramBadRequest as error:
+            error_text = str(error).lower()
+            if "message is not modified" in error_text:
+                # Текст и кнопки уже актуальны — это нормальная ситуация.
+                continue
+            if "message to edit not found" in error_text or "message can't be edited" in error_text:
+                with connect_db() as db:
+                    db.execute(
+                        "DELETE FROM announcements WHERE queue_id = ? AND chat_id = ? AND message_id = ?",
+                        (queue_id, announcement["chat_id"], announcement["message_id"]),
+                    )
+                print("Ссылка на недоступное объявление очереди очищена.")
+            else:
+                print(f"Не удалось обновить объявление очереди: {error}")
         except Exception as error:
-            print(f"Не удалось обновить объявление: {error}")
+            print(f"Не удалось обновить объявление очереди: {error}")
 
 
 def main_menu(user_id=None):
@@ -456,6 +471,77 @@ def seminars_keyboard(user_id=None):
 
 
 
+def seminar_topics_text(seminar_id):
+    """Полный список тем и записавшихся; кнопки остаются короткими."""
+    with connect_db() as db:
+        seminar = db.execute("SELECT title FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
+        topics = db.execute(
+            """
+            SELECT st.id, st.topic_name, st.user_id, st.user_name,
+                   GROUP_CONCAT(b.user_name, ', ') AS booked_names,
+                   COUNT(b.id) AS booking_count
+            FROM seminar_topics st
+            LEFT JOIN seminar_topic_bookings b ON b.topic_id = st.id
+            WHERE st.seminar_id = ?
+            GROUP BY st.id
+            ORDER BY st.id
+            """,
+            (seminar_id,),
+        ).fetchall()
+    if not seminar:
+        return "Этот семинар не найден."
+    taken_topics = 0
+    lines = [f"📚 {seminar['title']}", "", "📝 Темы и записи:"]
+    for i, topic in enumerate(topics, 1):
+        names = topic["booked_names"]
+        if not names and topic["user_id"] is not None:
+            names = topic["user_name"] or "Участник"
+        if names:
+            taken_topics += 1
+            line = f"🔴 {i}. {topic['topic_name']}\n   👤 Записались: {names}"
+        else:
+            line = f"🟢 {i}. {topic['topic_name']}\n   👤 Пока никто не записался"
+        # Оставляем запас до лимита Telegram в 4096 символов.
+        if sum(len(part) + 1 for part in lines) + len(line) > 3600:
+            lines.append("… Список длиннее лимита сообщения. Остальные темы доступны по кнопкам ниже.")
+            break
+        lines.append(line)
+    lines.insert(3, f"Занято тем: {taken_topics}/{len(topics)}")
+    lines.extend(["", "👇 Выбери тему кнопкой ниже. На одну тему могут записаться несколько человек."])
+    return "\n".join(lines)
+
+
+async def update_seminar_announcement(seminar_id):
+    with connect_db() as db:
+        seminar = db.execute("SELECT id, title FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
+        announcements = db.execute(
+            "SELECT chat_id, message_id FROM seminar_announcements WHERE seminar_id = ?", (seminar_id,)
+        ).fetchall()
+    if not seminar or not announcements:
+        return
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start=seminar_{seminar_id}"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📚 Выбрать тему семинара", url=link)]])
+    text = "📢 ЗАПИСЬ НА СЕМИНАР ОТКРЫТА!\n\n" + seminar_topics_text(seminar_id) + "\n\n👇 Нажмите кнопку, чтобы открыть темы."
+    # Не допускаем превышения лимита Telegram для текста объявления.
+    text = text[:4000]
+    for announcement in announcements:
+        try:
+            await bot.edit_message_text(chat_id=announcement["chat_id"], message_id=announcement["message_id"], text=text, reply_markup=keyboard)
+        except TelegramBadRequest as error:
+            error_text = str(error).lower()
+            if "message is not modified" in error_text:
+                continue
+            if "message to edit not found" in error_text or "message can't be edited" in error_text:
+                with connect_db() as db:
+                    db.execute("DELETE FROM seminar_announcements WHERE seminar_id = ? AND chat_id = ? AND message_id = ?", (seminar_id, announcement["chat_id"], announcement["message_id"]))
+                print("Ссылка на недоступное объявление семинара очищена.")
+            else:
+                print(f"Не удалось обновить объявление семинара: {error}")
+        except Exception as error:
+            print(f"Не удалось обновить объявление семинара: {error}")
+
+
 def seminar_topics_keyboard(seminar_id):
     with connect_db() as db:
         topics = db.execute(
@@ -480,10 +566,10 @@ def seminar_topics_keyboard(seminar_id):
         if not names and topic["user_id"] is not None:
             names = topic["user_name"] or "Участник"
         if names:
-            label = f"🔴 {topic['topic_name']} ({topic['booking_count'] or 1}): {names}"
+            label = f"🔴 {topic['topic_name']} ({topic['booking_count'] or 1})"
         else:
-            label = f"🟢 {topic['topic_name']} — записаться"
-        # Тему можно выбрать даже если на неё уже записались другие.
+            label = f"🟢 {topic['topic_name']}"
+        # Имена участников показываются отдельным сообщением, а не в кнопках.
         rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"topic_book:{topic['id']}")])
 
     rows.append([InlineKeyboardButton(text="❌ Снять мою тему", callback_data=f"topic_cancel:{seminar_id}")])
@@ -573,10 +659,7 @@ async def start(message: Message):
                 seminar = db.execute("SELECT id, title, group_chat_id FROM seminars WHERE id = ?", (seminar_id,)).fetchone()
             if seminar and await verify_group_member(message.from_user.id, seminar["group_chat_id"]):
                 set_selected_group(message.from_user.id, seminar["group_chat_id"])
-                await message.answer(
-                    f"📚 {seminar['title']}\nНажми на свободную тему, чтобы занять её.",
-                    reply_markup=seminar_topics_keyboard(seminar_id)
-                )
+                await message.answer(seminar_topics_text(seminar_id), reply_markup=seminar_topics_keyboard(seminar_id))
             else:
                 await message.answer("👽 Этот семинар не найден. Возможно, его уже удалили.")
             return
@@ -774,8 +857,13 @@ async def delete_queue_execute(callback: CallbackQuery):
                     chat_id=announcement["chat_id"],
                     message_id=announcement["message_id"],
                 )
+            except TelegramBadRequest as error:
+                error_text = str(error).lower()
+                if "message to delete not found" in error_text or "message can't be deleted for everyone" in error_text:
+                    print("Объявление очереди уже удалено или Telegram не разрешил его удалить; очередь удалена из базы.")
+                else:
+                    print(f"Не удалось удалить объявление очереди: {error}")
             except Exception as error:
-                # Например, если сообщение уже удалили вручную или у бота нет прав.
                 print(f"Не удалось удалить объявление очереди: {error}")
         await callback.message.answer("💥 Очередь удалена. Одной проблемой меньше.", reply_markup=main_menu(callback.from_user.id))
     else:
@@ -845,7 +933,7 @@ async def seminar_view(callback: CallbackQuery):
     if count == 0:
         await callback.message.answer(f"📚 {seminar['title']}\nПока тем нет.")
         return
-    await callback.message.answer(f"📚 {seminar['title']}\nНажми на свободную тему, чтобы занять её.", reply_markup=seminar_topics_keyboard(seminar_id))
+    await callback.message.answer(seminar_topics_text(seminar_id), reply_markup=seminar_topics_keyboard(seminar_id))
 
 
 @dp.callback_query(F.data.startswith("seminar_publish:"))
@@ -873,10 +961,8 @@ async def publish_seminar(callback: CallbackQuery):
         ]])
         sent = await bot.send_message(
             seminar["group_chat_id"],
-            f"📢 ЗАПИСЬ НА СЕМИНАР ОТКРЫТА!\n\n"
-            f"📚 {seminar['title']}\n"
-            f"📝 Тем в списке: {topics}\n\n"
-            "👇 Нажмите кнопку, чтобы посмотреть темы и выбрать свою.",
+            f"📢 ЗАПИСЬ НА СЕМИНАР ОТКРЫТА!\n\n" +
+            seminar_topics_text(seminar_id) + "\n\n👇 Нажмите кнопку, чтобы открыть темы и выбрать свою.",
             reply_markup=keyboard
         )
         with connect_db() as db:
@@ -934,6 +1020,12 @@ async def delete_seminar_execute(callback: CallbackQuery):
     for announcement in announcements:
         try:
             await bot.delete_message(chat_id=announcement["chat_id"], message_id=announcement["message_id"])
+        except TelegramBadRequest as error:
+            error_text = str(error).lower()
+            if "message to delete not found" in error_text or "message can't be deleted for everyone" in error_text:
+                print("Объявление семинара уже удалено или Telegram не разрешил его удалить; семинар удалён из базы.")
+            else:
+                print(f"Не удалось удалить старое объявление семинара: {error}")
         except Exception as error:
             print(f"Не удалось удалить старое объявление семинара: {error}")
     await callback.answer("Семинар удалён.")
@@ -986,9 +1078,10 @@ async def topic_book(callback: CallbackQuery):
             await callback.answer("Ты уже записан(а) на эту тему!", show_alert=True)
             return
 
+    await update_seminar_announcement(topic["seminar_id"])
     await callback.answer("🎉 Записала тебя на тему!")
     await callback.message.answer(
-        f"Тема «{topic['topic_name']}» — запись добавлена.",
+        seminar_topics_text(topic["seminar_id"]),
         reply_markup=seminar_topics_keyboard(topic["seminar_id"]),
     )
 
@@ -1010,7 +1103,8 @@ async def topic_cancel(callback: CallbackQuery):
         )
     await callback.answer()
     if cursor.rowcount or legacy.rowcount:
-        await callback.message.answer("🫡 Твоя запись снята. Остальные участники остаются записанными.", reply_markup=seminar_topics_keyboard(seminar_id))
+        await update_seminar_announcement(seminar_id)
+        await callback.message.answer(seminar_topics_text(seminar_id), reply_markup=seminar_topics_keyboard(seminar_id))
     else:
         await callback.message.answer("У тебя нет выбранной темы в этом семинаре.")
 
@@ -1191,7 +1285,7 @@ async def receive_text(message: Message):
                 seminar_id = cursor.lastrowid
                 db.executemany("INSERT INTO seminar_topics (seminar_id, topic_name) VALUES (?, ?)", [(seminar_id, topic) for topic in topics])
             await message.answer(f"🎉 Семинар «{title}» создан: тем — {len(topics)}.", reply_markup=main_menu(user_id))
-            await message.answer("Список тем:", reply_markup=seminar_topics_keyboard(seminar_id))
+            await message.answer(seminar_topics_text(seminar_id), reply_markup=seminar_topics_keyboard(seminar_id))
             return
         if len(text) > 150:
             await message.answer("Одна тема должна быть не длиннее 150 символов.")
