@@ -184,6 +184,14 @@ def init_db():
             )
         """)
         db.execute("""
+            CREATE TABLE IF NOT EXISTS sent_bot_notifications (
+                user_id INTEGER NOT NULL,
+                notification_key TEXT NOT NULL,
+                sent_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, notification_key)
+            )
+        """)
+        db.execute("""
             CREATE TABLE IF NOT EXISTS seminar_topic_bookings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 topic_id INTEGER NOT NULL,
@@ -266,6 +274,45 @@ async def verify_group_admin(user_id, chat_id):
         return member.status in {"creator", "administrator"}
     except Exception:
         return False
+
+
+STAROSTA_UPDATE_KEY = "secret_santa_2026"
+STAROSTA_UPDATE_TEXT = (
+    "🎅 Обнова подкралась незаметно!\n\n"
+    "Посылайте в одно место платных ботов в Telegram — теперь Тайного Санту "
+    "можно устроить прямо здесь! Создавайте игру, собирайте вишлисты и "
+    "проводите жеребьёвку ТУТА ПРЯМО ВАЩЕ ДААА\n\n"
+    "Привет от первашей! 🎁"
+)
+
+
+async def notify_starosta_about_update(user_id):
+    """Send the Secret Santa update once; failed private deliveries can be retried later."""
+    with connect_db() as db:
+        already_sent = db.execute(
+            "SELECT 1 FROM sent_bot_notifications WHERE user_id = ? AND notification_key = ?",
+            (user_id, STAROSTA_UPDATE_KEY),
+        ).fetchone()
+    if already_sent:
+        return False
+    try:
+        await bot.send_message(user_id, STAROSTA_UPDATE_TEXT)
+    except Exception as error:
+        print(f"Не удалось отправить обновление старосте {user_id}: {error}")
+        return False
+    with connect_db() as db:
+        db.execute(
+            "INSERT OR IGNORE INTO sent_bot_notifications (user_id, notification_key, sent_at) VALUES (?, ?, ?)",
+            (user_id, STAROSTA_UPDATE_KEY, datetime.utcnow().isoformat(timespec="seconds")),
+        )
+    return True
+
+
+async def notify_all_starostas_about_update():
+    with connect_db() as db:
+        rows = db.execute("SELECT DISTINCT user_id FROM group_admins").fetchall()
+    for row in rows:
+        await notify_starosta_about_update(row["user_id"])
 
 
 def item_belongs_to_group(kind, item_id, chat_id):
@@ -772,6 +819,8 @@ async def show_my_id(message: Message):
 
 @dp.message(CommandStart())
 async def start(message: Message):
+    if message.chat.type == "private" and is_admin(message.from_user.id):
+        await notify_starosta_about_update(message.from_user.id)
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) > 1 and parts[1].startswith("santa_join_"):
         try:
@@ -1711,6 +1760,7 @@ staged_topics = {}
 async def main():
     init_db()
     print(f"Бот запускается... База данных: {os.path.abspath(DB_FILE)}")
+    await notify_all_starostas_about_update()
     await dp.start_polling(bot)
 
 
