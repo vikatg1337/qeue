@@ -58,6 +58,8 @@ waiting_for_change_queue = {}
 waiting_for_proxy_name = {}       # user_id -> (queue_id, place)
 waiting_for_seminar_title = set()
 waiting_for_seminar_topics = {}   # user_id -> seminar title
+waiting_for_santa_title = set()
+waiting_for_santa_wishlist = {}  # user_id -> game_id
 
 
 def connect_db():
@@ -158,6 +160,29 @@ def init_db():
             )
         """)
         # Отдельная таблица записей позволяет нескольким людям выбрать одну тему.
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS santa_games (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_chat_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                created_by INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS santa_participants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                user_name TEXT NOT NULL,
+                wishlist TEXT,
+                recipient_user_id INTEGER,
+                joined_at TEXT NOT NULL,
+                UNIQUE(game_id, user_id),
+                FOREIGN KEY (game_id) REFERENCES santa_games(id)
+            )
+        """)
         db.execute("""
             CREATE TABLE IF NOT EXISTS seminar_topic_bookings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -380,11 +405,99 @@ async def update_queue_announcement(queue_id):
             print(f"Не удалось обновить объявление очереди: {error}")
 
 
+
+def santa_game(game_id):
+    with connect_db() as db:
+        return db.execute("SELECT * FROM santa_games WHERE id = ?", (game_id,)).fetchone()
+
+
+def santa_games_for_group(group_id):
+    with connect_db() as db:
+        return db.execute(
+            "SELECT * FROM santa_games WHERE group_chat_id = ? ORDER BY id DESC",
+            (group_id,),
+        ).fetchall()
+
+
+def santa_game_text(game_id):
+    game = santa_game(game_id)
+    if not game:
+        return "Игра не найдена."
+    with connect_db() as db:
+        people = db.execute(
+            "SELECT user_name, wishlist FROM santa_participants WHERE game_id = ? ORDER BY joined_at",
+            (game_id,),
+        ).fetchall()
+    ready = sum(bool((person["wishlist"] or "").strip()) for person in people)
+    status = "🟢 Регистрация открыта" if game["status"] == "open" else "🔒 Жеребьёвка проведена"
+    lines = [
+        f"🎅 {game['title']}", status,
+        f"Участников: {len(people)}",
+        f"Вишлисты заполнены: {ready}/{len(people)}", "", "Участники:",
+    ]
+    lines.extend(
+        f"{'✅' if (person['wishlist'] or '').strip() else '📝'} {person['user_name']}"
+        for person in people
+    )
+    if not people:
+        lines.append("Пока никто не записался.")
+    if game["status"] == "open":
+        lines.extend(["", "Для жеребьёвки нужно минимум 2 участника и заполненные вишлисты у всех."])
+    return "\n".join(lines)
+
+
+def santa_admin_keyboard(game_id, status):
+    rows = []
+    if status == "open":
+        rows.append([InlineKeyboardButton(text="🎲 Закрыть регистрацию и провести жеребьёвку", callback_data=f"santa_draw:{game_id}")])
+    else:
+        rows.append([InlineKeyboardButton(text="📨 Повторно отправить результаты", callback_data=f"santa_resend:{game_id}")])
+    rows.extend([
+        [InlineKeyboardButton(text="🔙 К играм", callback_data="santa")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_santa_results(game_id):
+    game = santa_game(game_id)
+    if not game or game["status"] != "drawn":
+        return 0, 0
+    with connect_db() as db:
+        assignments = db.execute("""
+            SELECT giver.user_id AS giver_id,
+                   receiver.user_name AS receiver_name,
+                   receiver.wishlist AS receiver_wishlist
+            FROM santa_participants AS giver
+            JOIN santa_participants AS receiver
+              ON receiver.game_id = giver.game_id
+             AND receiver.user_id = giver.recipient_user_id
+            WHERE giver.game_id = ?
+            ORDER BY giver.id
+        """, (game_id,)).fetchall()
+    sent = failed = 0
+    for item in assignments:
+        text = (
+            f"🎅 Тайный Санта — {game['title']}!\n\n"
+            f"Твой получатель: {item['receiver_name']}\n\n"
+            f"🎁 Вишлист:\n{item['receiver_wishlist']}\n\n"
+            "Сохраняй секрет и не выдавай себя раньше времени 🤫"
+        )
+        try:
+            await bot.send_message(item["giver_id"], text)
+            sent += 1
+        except Exception as error:
+            failed += 1
+            print(f"Не удалось отправить Тайного Санту пользователю {item['giver_id']}: {error}")
+    return sent, failed
+
+
 def main_menu(user_id=None):
     rows = [
         [InlineKeyboardButton(text="➕ Создать очередь", callback_data="create")],
         [InlineKeyboardButton(text="📋 Все очереди", callback_data="queues")],
         [InlineKeyboardButton(text="📚 Темы семинаров", callback_data="seminars")],
+        [InlineKeyboardButton(text="🎅 Тайный Санта", callback_data="santa")],
         [InlineKeyboardButton(text="🏫 Выбрать учебную группу (/groups)", callback_data="groups_help")],
     ]
     if user_id is not None and is_admin(user_id, selected_group_id(user_id)):
@@ -660,6 +773,52 @@ async def show_my_id(message: Message):
 @dp.message(CommandStart())
 async def start(message: Message):
     parts = (message.text or "").split(maxsplit=1)
+    if len(parts) > 1 and parts[1].startswith("santa_join_"):
+        try:
+            game_id = int(parts[1].replace("santa_join_", "", 1))
+        except ValueError:
+            game_id = 0
+        game = santa_game(game_id) if game_id else None
+        if not game:
+            await message.answer("🎅 Эта игра не найдена.")
+            return
+        if game["status"] != "open":
+            await message.answer("Регистрация на эту игру уже закрыта.")
+            return
+        if not await verify_group_member(message.from_user.id, game["group_chat_id"]):
+            await message.answer("⛔ Не удалось подтвердить, что ты состоишь в учебной группе.")
+            return
+        user = message.from_user
+        display_name = user.full_name or user.username or str(user.id)
+        with connect_db() as db:
+            db.execute("""
+                INSERT OR IGNORE INTO santa_participants
+                    (game_id, user_id, user_name, joined_at)
+                VALUES (?, ?, ?, ?)
+            """, (game_id, user.id, display_name, datetime.utcnow().isoformat(timespec="seconds")))
+            db.execute(
+                "UPDATE santa_participants SET user_name = ? WHERE game_id = ? AND user_id = ?",
+                (display_name, game_id, user.id),
+            )
+            participant = db.execute(
+                "SELECT wishlist FROM santa_participants WHERE game_id = ? AND user_id = ?",
+                (game_id, user.id),
+            ).fetchone()
+        set_selected_group(user.id, game["group_chat_id"])
+        waiting_for_santa_wishlist[user.id] = game_id
+        if participant and participant["wishlist"]:
+            await message.answer(
+                f"🎅 Ты уже участвуешь в игре «{game['title']}»!\n"
+                f"Твой текущий вишлист:\n{participant['wishlist']}\n\n"
+                "Отправь новый текст, если хочешь его изменить."
+            )
+        else:
+            await message.answer(
+                f"🎅 Ты записан(а) в игру «{game['title']}»!\n\n"
+                "Отправь вишлист одним сообщением: что хотелось бы получить, любимые цвета/вкусы, идеи и ограничения.\n"
+                "Его увидит только твой Тайный Санта. Для отмены — /cancel."
+            )
+        return
     if len(parts) > 1 and parts[1].startswith("seminar_"):
         try:
             seminar_id = int(parts[1].replace("seminar_", "", 1))
@@ -694,6 +853,170 @@ async def start(message: Message):
         "Короче очередь занимаем электронная не толпимся ноги поднимаем\n\nВыбирай действие:",
         reply_markup=main_menu(message.from_user.id),
     )
+
+
+@dp.callback_query(F.data == "santa")
+async def santa_menu(callback: CallbackQuery):
+    await callback.answer()
+    group_id = selected_group_id(callback.from_user.id)
+    if not group_id:
+        await callback.message.answer("Сначала выбери учебную группу через /groups.")
+        return
+    rows = []
+    if is_admin(callback.from_user.id, group_id):
+        rows.append([InlineKeyboardButton(text="➕ Создать игру", callback_data="santa_create")])
+    for game in santa_games_for_group(group_id):
+        icon = "🟢" if game["status"] == "open" else "🔒"
+        rows.append([InlineKeyboardButton(text=f"{icon} {game['title']}", callback_data=f"santa_view:{game['id']}")])
+    rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")])
+    await callback.message.answer(
+        "🎅 Тайный Санта\nВыбери игру или создай новую:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data == "santa_create")
+async def santa_create(callback: CallbackQuery):
+    group_id = selected_group_id(callback.from_user.id)
+    if not group_id or not is_admin(callback.from_user.id, group_id):
+        await callback.answer("Создавать игры может только староста.", show_alert=True)
+        return
+    waiting_for_santa_title.add(callback.from_user.id)
+    await callback.answer()
+    await callback.message.answer("🎁 Напиши название игры, например «Тайный Санта — Новый год». Для отмены — /cancel.")
+
+
+@dp.callback_query(F.data.startswith("santa_view:"))
+async def santa_view(callback: CallbackQuery):
+    try:
+        game_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная игра.", show_alert=True)
+        return
+    game = santa_game(game_id)
+    if not game or game["group_chat_id"] != selected_group_id(callback.from_user.id):
+        await callback.answer("Эта игра относится к другой группе.", show_alert=True)
+        return
+    if is_admin(callback.from_user.id, game["group_chat_id"]):
+        await callback.answer()
+        await callback.message.answer(
+            santa_game_text(game_id),
+            reply_markup=santa_admin_keyboard(game_id, game["status"]),
+        )
+        return
+    with connect_db() as db:
+        participant = db.execute(
+            "SELECT wishlist FROM santa_participants WHERE game_id = ? AND user_id = ?",
+            (game_id, callback.from_user.id),
+        ).fetchone()
+    if not participant:
+        await callback.answer("Ты пока не участвуешь в этой игре.", show_alert=True)
+        return
+    await callback.answer()
+    rows = []
+    if game["status"] == "open":
+        rows.append([InlineKeyboardButton(text="✏️ Изменить вишлист", callback_data=f"santa_edit:{game_id}")])
+    rows.append([InlineKeyboardButton(text="🔙 К играм", callback_data="santa")])
+    wishlist_text = participant["wishlist"] or "Пока не заполнен."
+    await callback.message.answer(
+        f"🎅 {game['title']}\n\nТвой вишлист:\n{wishlist_text}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("santa_edit:"))
+async def santa_edit_wishlist(callback: CallbackQuery):
+    try:
+        game_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная игра.", show_alert=True)
+        return
+    game = santa_game(game_id)
+    if not game or game["status"] != "open":
+        await callback.answer("Редактирование уже закрыто.", show_alert=True)
+        return
+    with connect_db() as db:
+        participant = db.execute(
+            "SELECT 1 FROM santa_participants WHERE game_id = ? AND user_id = ?",
+            (game_id, callback.from_user.id),
+        ).fetchone()
+    if not participant:
+        await callback.answer("Ты не участвуешь в этой игре.", show_alert=True)
+        return
+    waiting_for_santa_wishlist[callback.from_user.id] = game_id
+    await callback.answer()
+    await callback.message.answer("✏️ Отправь новый вишлист одним сообщением (до 1000 символов). Для отмены — /cancel.")
+
+
+@dp.callback_query(F.data.startswith("santa_draw:"))
+async def santa_draw(callback: CallbackQuery):
+    try:
+        game_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная игра.", show_alert=True)
+        return
+    game = santa_game(game_id)
+    if not game or not is_admin(callback.from_user.id, game["group_chat_id"]):
+        await callback.answer("Только староста может провести жеребьёвку.", show_alert=True)
+        return
+    if game["status"] != "open":
+        await callback.answer("Жеребьёвка уже проведена.", show_alert=True)
+        return
+    with connect_db() as db:
+        people = db.execute(
+            "SELECT user_id, user_name, wishlist FROM santa_participants WHERE game_id = ? ORDER BY id",
+            (game_id,),
+        ).fetchall()
+    if len(people) < 2:
+        await callback.answer("Нужно минимум два участника.", show_alert=True)
+        return
+    missing = [person["user_name"] for person in people if not (person["wishlist"] or "").strip()]
+    if missing:
+        names = ", ".join(missing[:4]) + ("…" if len(missing) > 4 else "")
+        await callback.answer(f"Не заполнены вишлисты: {names}", show_alert=True)
+        return
+    givers = [person["user_id"] for person in people]
+    receivers = givers[:]
+    rng = secrets.SystemRandom()
+    while True:
+        rng.shuffle(receivers)
+        if all(giver != receiver for giver, receiver in zip(givers, receivers)):
+            break
+    # Сначала сохраняем распределение, затем меняем статус. Повторный callback не перетасует пары.
+    with connect_db() as db:
+        current = db.execute("SELECT status FROM santa_games WHERE id = ?", (game_id,)).fetchone()
+        if not current or current["status"] != "open":
+            await callback.answer("Жеребьёвка уже проведена.", show_alert=True)
+            return
+        for giver_id, receiver_id in zip(givers, receivers):
+            db.execute(
+                "UPDATE santa_participants SET recipient_user_id = ? WHERE game_id = ? AND user_id = ?",
+                (receiver_id, game_id, giver_id),
+            )
+        db.execute("UPDATE santa_games SET status = 'drawn' WHERE id = ?", (game_id,))
+    await callback.answer("Жеребьёвка проведена!")
+    sent, failed = await send_santa_results(game_id)
+    await callback.message.answer(
+        f"🎉 Жеребьёвка завершена!\nУспешно отправлено: {sent}. Не доставлено: {failed}.\n"
+        "Распределение сохранено и не изменится при повторной отправке.",
+        reply_markup=santa_admin_keyboard(game_id, "drawn"),
+    )
+
+
+@dp.callback_query(F.data.startswith("santa_resend:"))
+async def santa_resend(callback: CallbackQuery):
+    try:
+        game_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная игра.", show_alert=True)
+        return
+    game = santa_game(game_id)
+    if not game or game["status"] != "drawn" or not is_admin(callback.from_user.id, game["group_chat_id"]):
+        await callback.answer("Нет доступа или жеребьёвка ещё не проведена.", show_alert=True)
+        return
+    await callback.answer("Отправляю результаты…")
+    sent, failed = await send_santa_results(game_id)
+    await callback.message.answer(f"📨 Повторная отправка завершена. Успешно: {sent}, ошибки: {failed}.")
 
 
 @dp.callback_query(F.data == "groups_help")
@@ -1137,7 +1460,75 @@ async def receive_text(message: Message):
         waiting_for_seminar_title.discard(user_id)
         waiting_for_seminar_topics.pop(user_id, None)
         staged_topics.pop(user_id, None)
+        waiting_for_santa_title.discard(user_id)
+        waiting_for_santa_wishlist.pop(user_id, None)
         await message.answer("Окей, как хош.", reply_markup=main_menu(user_id))
+        return
+
+    if user_id in waiting_for_santa_title:
+        group_id = selected_group_id(user_id)
+        if not group_id or not is_admin(user_id, group_id):
+            waiting_for_santa_title.discard(user_id)
+            await message.answer("Создавать игры может только староста.")
+            return
+        if not text or len(text) > 100:
+            await message.answer("Название должно быть от 1 до 100 символов.")
+            return
+        waiting_for_santa_title.discard(user_id)
+        with connect_db() as db:
+            cursor = db.execute(
+                "INSERT INTO santa_games (group_chat_id, title, created_by, status, created_at) VALUES (?, ?, ?, 'open', ?)",
+                (group_id, text, user_id, datetime.utcnow().isoformat(timespec="seconds")),
+            )
+            game_id = cursor.lastrowid
+        me = await bot.get_me()
+        join_url = f"https://t.me/{me.username}?start=santa_join_{game_id}"
+        markup = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🎅 Участвовать и заполнить вишлист", url=join_url)
+        ]])
+        try:
+            await bot.send_message(
+                group_id,
+                f"🎅 Открыта регистрация на игру «{text}»!\n\n"
+                "Нажми кнопку, чтобы участвовать, и заполни вишлист в личке с ботом. "
+                "Староста проведёт жеребьёвку, когда все будут готовы.",
+                reply_markup=markup,
+            )
+            await message.answer("🎉 Игра создана! Приглашение опубликовано в учебной группе.", reply_markup=main_menu(user_id))
+        except Exception as error:
+            print(f"Не удалось опубликовать приглашение Тайного Санты: {error}")
+            await message.answer(
+                f"Игра создана, но не удалось отправить приглашение в группу.\nСсылка для участников: {join_url}\n"
+                "Проверь, что бот добавлен в группу и может отправлять сообщения.",
+                reply_markup=main_menu(user_id),
+            )
+        return
+
+    if user_id in waiting_for_santa_wishlist:
+        game_id = waiting_for_santa_wishlist[user_id]
+        game = santa_game(game_id)
+        if not game or game["status"] != "open":
+            waiting_for_santa_wishlist.pop(user_id, None)
+            await message.answer("Регистрация на эту игру уже закрыта.")
+            return
+        if not text or len(text) > 1000:
+            await message.answer("Вишлист должен быть от 1 до 1000 символов. Отправь его одним сообщением.")
+            return
+        with connect_db() as db:
+            result = db.execute(
+                "UPDATE santa_participants SET wishlist = ? WHERE game_id = ? AND user_id = ?",
+                (text, game_id, user_id),
+            )
+        if result.rowcount:
+            await message.answer(
+                f"✅ Вишлист для игры «{game['title']}» сохранён!",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="🎅 Моя игра", callback_data=f"santa_view:{game_id}")
+                ]]),
+            )
+        else:
+            await message.answer("Не нашла твою запись в этой игре. Попробуй снова открыть ссылку из чата группы.")
+        waiting_for_santa_wishlist.pop(user_id, None)
         return
 
     if user_id in waiting_for_proxy_name:
