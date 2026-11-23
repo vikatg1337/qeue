@@ -184,14 +184,6 @@ def init_db():
             )
         """)
         db.execute("""
-            CREATE TABLE IF NOT EXISTS sent_bot_notifications (
-                user_id INTEGER NOT NULL,
-                notification_key TEXT NOT NULL,
-                sent_at TEXT NOT NULL,
-                PRIMARY KEY (user_id, notification_key)
-            )
-        """)
-        db.execute("""
             CREATE TABLE IF NOT EXISTS seminar_topic_bookings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 topic_id INTEGER NOT NULL,
@@ -274,45 +266,6 @@ async def verify_group_admin(user_id, chat_id):
         return member.status in {"creator", "administrator"}
     except Exception:
         return False
-
-
-STAROSTA_UPDATE_KEY = "secret_santa_2026"
-STAROSTA_UPDATE_TEXT = (
-    "🎅 Обнова подкралась незаметно!\n\n"
-    "Посылайте в одно место платных ботов в Telegram — теперь Тайного Санту "
-    "можно устроить прямо здесь! Создавайте игру, собирайте вишлисты и "
-    "проводите жеребьёвку ТУТА ПРЯМО ВАЩЕ ДААА\n\n"
-    "Привет от первашей! 🎁"
-)
-
-
-async def notify_starosta_about_update(user_id):
-    """Send the Secret Santa update once; failed private deliveries can be retried later."""
-    with connect_db() as db:
-        already_sent = db.execute(
-            "SELECT 1 FROM sent_bot_notifications WHERE user_id = ? AND notification_key = ?",
-            (user_id, STAROSTA_UPDATE_KEY),
-        ).fetchone()
-    if already_sent:
-        return False
-    try:
-        await bot.send_message(user_id, STAROSTA_UPDATE_TEXT)
-    except Exception as error:
-        print(f"Не удалось отправить обновление старосте {user_id}: {error}")
-        return False
-    with connect_db() as db:
-        db.execute(
-            "INSERT OR IGNORE INTO sent_bot_notifications (user_id, notification_key, sent_at) VALUES (?, ?, ?)",
-            (user_id, STAROSTA_UPDATE_KEY, datetime.utcnow().isoformat(timespec="seconds")),
-        )
-    return True
-
-
-async def notify_all_starostas_about_update():
-    with connect_db() as db:
-        rows = db.execute("SELECT DISTINCT user_id FROM group_admins").fetchall()
-    for row in rows:
-        await notify_starosta_about_update(row["user_id"])
 
 
 def item_belongs_to_group(kind, item_id, chat_id):
@@ -496,6 +449,7 @@ def santa_game_text(game_id):
 def santa_admin_keyboard(game_id, status):
     rows = []
     if status == "open":
+        rows.append([InlineKeyboardButton(text="🗑 Удалить участника", callback_data=f"santa_kicklist:{game_id}")])
         rows.append([InlineKeyboardButton(text="🎲 Закрыть регистрацию и провести жеребьёвку", callback_data=f"santa_draw:{game_id}")])
     else:
         rows.append([InlineKeyboardButton(text="📨 Повторно отправить результаты", callback_data=f"santa_resend:{game_id}")])
@@ -503,6 +457,23 @@ def santa_admin_keyboard(game_id, status):
         [InlineKeyboardButton(text="🔙 К играм", callback_data="santa")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")],
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def santa_remove_keyboard(game_id):
+    with connect_db() as db:
+        people = db.execute(
+            "SELECT user_id, user_name FROM santa_participants WHERE game_id = ? ORDER BY joined_at",
+            (game_id,),
+        ).fetchall()
+    rows = [
+        [InlineKeyboardButton(
+            text=f"❌ {person['user_name']}",
+            callback_data=f"santa_kick:{game_id}:{person['user_id']}",
+        )]
+        for person in people
+    ]
+    rows.append([InlineKeyboardButton(text="🔙 Назад к игре", callback_data=f"santa_view:{game_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -819,8 +790,6 @@ async def show_my_id(message: Message):
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    if message.chat.type == "private" and is_admin(message.from_user.id):
-        await notify_starosta_about_update(message.from_user.id)
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) > 1 and parts[1].startswith("santa_join_"):
         try:
@@ -995,6 +964,83 @@ async def santa_edit_wishlist(callback: CallbackQuery):
     waiting_for_santa_wishlist[callback.from_user.id] = game_id
     await callback.answer()
     await callback.message.answer("✏️ Отправь новый вишлист одним сообщением (до 1000 символов). Для отмены — /cancel.")
+
+
+@dp.callback_query(F.data.startswith("santa_kicklist:"))
+async def santa_kicklist(callback: CallbackQuery):
+    try:
+        game_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная игра.", show_alert=True)
+        return
+    game = santa_game(game_id)
+    if not game or not is_admin(callback.from_user.id, game["group_chat_id"]):
+        await callback.answer("Только староста может управлять участниками.", show_alert=True)
+        return
+    if game["status"] != "open":
+        await callback.answer("После жеребьёвки удалять участников нельзя.", show_alert=True)
+        return
+    with connect_db() as db:
+        count = db.execute(
+            "SELECT COUNT(*) AS total FROM santa_participants WHERE game_id = ?", (game_id,)
+        ).fetchone()["total"]
+    if not count:
+        await callback.answer("В игре пока нет участников.", show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.answer(
+        "Кого исключаем из игры? Это удалит его вишлист и запись из текущей игры.",
+        reply_markup=santa_remove_keyboard(game_id),
+    )
+
+
+@dp.callback_query(F.data.startswith("santa_kick:"))
+async def santa_kick(callback: CallbackQuery):
+    try:
+        _, game_id_text, target_id_text = callback.data.split(":", 2)
+        game_id = int(game_id_text)
+        target_id = int(target_id_text)
+    except (ValueError, TypeError):
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    game = santa_game(game_id)
+    if not game or not is_admin(callback.from_user.id, game["group_chat_id"]):
+        await callback.answer("Только староста может удалять участников.", show_alert=True)
+        return
+    if game["status"] != "open":
+        await callback.answer("После жеребьёвки удалять участников нельзя.", show_alert=True)
+        return
+    with connect_db() as db:
+        person = db.execute(
+            "SELECT user_name FROM santa_participants WHERE game_id = ? AND user_id = ?",
+            (game_id, target_id),
+        ).fetchone()
+        if not person:
+            await callback.answer("Участник уже отсутствует в игре.", show_alert=True)
+            return
+        db.execute(
+            "DELETE FROM santa_participants WHERE game_id = ? AND user_id = ?",
+            (game_id, target_id),
+        )
+    waiting_for_santa_wishlist.pop(target_id, None)
+    await callback.answer(f"{person['user_name']} удалён из игры.")
+    try:
+        await bot.send_message(
+            target_id,
+            f"Тебя исключили из игры «{game['title']}» в Тайном Санте. Если это ошибка, свяжись со старостой.",
+        )
+    except Exception:
+        pass
+    try:
+        await callback.message.edit_text(
+            santa_game_text(game_id),
+            reply_markup=santa_admin_keyboard(game_id, "open"),
+        )
+    except TelegramBadRequest:
+        await callback.message.answer(
+            santa_game_text(game_id),
+            reply_markup=santa_admin_keyboard(game_id, "open"),
+        )
 
 
 @dp.callback_query(F.data.startswith("santa_draw:"))
@@ -1760,7 +1806,6 @@ staged_topics = {}
 async def main():
     init_db()
     print(f"Бот запускается... База данных: {os.path.abspath(DB_FILE)}")
-    await notify_all_starostas_about_update()
     await dp.start_polling(bot)
 
 
